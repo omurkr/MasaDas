@@ -399,8 +399,7 @@ public:
 
 // ---------- Openrouter STT ----------
 String transcribeAudio() {
-
-    Serial.println("\nOpenRouter Whisper STT baslatiliyor...");
+    Serial.println("\nOpenRouter Deepgram Nova-3 STT baslatiliyor...");
 
     File wav = LittleFS.open("/recording.wav", "r");
 
@@ -422,7 +421,8 @@ String transcribeAudio() {
     }
 
     const char *prefix =
-        "{\"model\":\"openai/whisper-large-v3-turbo\","
+        "{\"model\":\"deepgram/nova-3\","
+        "\"stream\":true,"
         "\"input_audio\":{\"data\":\"";
 
     const char *suffix =
@@ -451,6 +451,9 @@ String transcribeAudio() {
         wav.close();
         return "";
     }
+    
+    const char *responseHeaders[] = {"Content-Type"};
+    http.collectHeaders(responseHeaders, 1);
 
     http.addHeader(
         "Authorization",
@@ -469,7 +472,7 @@ String transcribeAudio() {
         (unsigned int)payload.length()
     );
 
-    Serial.println("Whisper istegi gonderiliyor...");
+    Serial.println("Nova-3 istegi gonderiliyor...");
 
     int status = http.sendRequest(
         "POST",
@@ -482,6 +485,11 @@ String transcribeAudio() {
     Serial.printf("STT HTTP durumu: %d\n", status);
 
     bool streamFailed = payload.failed();
+
+    Serial.printf(
+        "STT yanit Content-Type: %s\n",
+        http.header("Content-Type").c_str()
+    );
 
     http.end();
     wav.close();
@@ -810,7 +818,7 @@ bool playPcmChunk(const uint8_t *pcm, size_t pcmLength) {
 // ---------- TTS akisli oynatma altyapisi ----------
 
 static constexpr size_t TTS_STREAM_BUFFER_SIZE = 32768;
-static constexpr size_t TTS_PREBUFFER_SIZE = 24000;
+static constexpr size_t TTS_PREBUFFER_SIZE = 4096;
 
 static StreamBufferHandle_t ttsStreamBuffer = nullptr;
 
@@ -827,71 +835,137 @@ static volatile size_t ttsPlayedBytes = 0;
 
 static uint8_t ttsPlaybackBuffer[3074];
 
-class TtsPcmStream : public Stream {
-public:
-    explicit TtsPcmStream(StreamBufferHandle_t buffer)
-        : buffer_(buffer) {}
+// ---------- Elle chunked okuma ----------
 
-    int available() override {
-        return static_cast<int>(
-            xStreamBufferBytesAvailable(buffer_)
+static uint8_t ttsNetBuffer[1024];
+
+// Veriyi akis tamponuna yazar; tampon doluysa bekler.
+static bool pushToTtsBuffer(const uint8_t *data, size_t length) {
+    size_t sent = 0;
+
+    while (sent < length) {
+        if (ttsPlaybackFailed) return false;
+
+        sent += xStreamBufferSend(
+            ttsStreamBuffer,
+            data + sent,
+            length - sent,
+            pdMS_TO_TICKS(100)
         );
     }
 
-    int read() override {
-        return -1;
-    }
+    return true;
+}
 
-    int peek() override {
-        return -1;
-    }
+// Bir satiri (\n'e kadar) okur; \r yok sayilir.
+static bool readHttpLine(WiFiClient *c, char *out, size_t cap,
+                         uint32_t timeoutMs) {
+    size_t len = 0;
+    uint32_t last = millis();
 
-    void flush() override {}
+    while (millis() - last < timeoutMs) {
+        if (c->available() > 0) {
+            int v = c->read();
+            if (v < 0) continue;
 
-    size_t write(uint8_t value) override {
-        return write(&value, 1);
-    }
+            last = millis();
 
-    size_t write(
-        const uint8_t *data,
-        size_t length
-    ) override {
-        if (data == nullptr || length == 0) {
-            return 0;
-        }
-
-        size_t totalSent = 0;
-
-        while (totalSent < length) {
-            if (ttsPlaybackFailed) {
-                return totalSent;
+            if (v == '\n') {
+                out[len] = '\0';
+                return true;
             }
 
-            size_t sent = xStreamBufferSend(
-                buffer_,
-                data + totalSent,
-                length - totalSent,
-                pdMS_TO_TICKS(1000)
-            );
+            if (v != '\r' && len + 1 < cap) {
+                out[len++] = static_cast<char>(v);
+            }
+        } else if (!c->connected()) {
+            return false;
+        } else {
+            delay(1);
+        }
+    }
 
-            if (sent == 0) {
-                if (ttsPlaybackFailed) {
-                    return totalSent;
-                }
+    return false;
+}
 
+// Tam `count` bayti okuyup akis tamponuna aktarir.
+static bool pumpBytes(WiFiClient *c, size_t count, uint32_t timeoutMs,
+                      size_t &total) {
+    uint32_t last = millis();
+
+    while (count > 0) {
+        int avail = c->available();
+
+        if (avail > 0) {
+            size_t want = static_cast<size_t>(avail);
+            if (want > count) want = count;
+            if (want > sizeof(ttsNetBuffer)) want = sizeof(ttsNetBuffer);
+
+            int got = c->read(ttsNetBuffer, want);
+
+            if (got > 0) {
+                if (!pushToTtsBuffer(ttsNetBuffer, got)) return false;
+                count -= got;
+                total += got;
+                last = millis();
                 continue;
             }
-
-            totalSent += sent;
+        } else if (!c->connected()) {
+            return false;
         }
 
-        return totalSent;
+        if (millis() - last > timeoutMs) return false;
+        delay(1);
     }
 
-private:
-    StreamBufferHandle_t buffer_;
-};
+    return true;
+}
 
+// HTTP govdesini (chunked veya sabit uzunluk) akis tamponuna aktarir.
+// Basarida toplam bayt sayisini, hatada -1 dondurur.
+static int streamTtsBody(WiFiClient *c, int contentLength) {
+    constexpr uint32_t STEP_TIMEOUT_MS = 15000;
+    size_t total = 0;
+
+    if (contentLength >= 0) {
+        if (!pumpBytes(c, contentLength, STEP_TIMEOUT_MS, total)) {
+            Serial.println("[TTS] HATA: govde okunamadi.");
+            return -1;
+        }
+        return static_cast<int>(total);
+    }
+
+    char line[24];
+
+    while (true) {
+        if (!readHttpLine(c, line, sizeof(line), STEP_TIMEOUT_MS)) {
+            Serial.printf("[TTS] HATA: chunk basligi okunamadi (alinan: %u).\n",
+                          static_cast<unsigned int>(total));
+            return -1;
+        }
+
+        size_t chunkSize = strtoul(line, nullptr, 16);
+
+        if (chunkSize == 0) {
+            if (line[0] == '\0') continue;   // bos satir, atla
+            break;                           // "0" = akisin sonu
+        }
+
+        if (!pumpBytes(c, chunkSize, STEP_TIMEOUT_MS, total)) {
+            Serial.printf("[TTS] HATA: chunk verisi eksik (alinan: %u).\n",
+                          static_cast<unsigned int>(total));
+            return -1;
+        }
+
+        // Chunk sonundaki CRLF.
+        if (!readHttpLine(c, line, sizeof(line), STEP_TIMEOUT_MS)) {
+            Serial.println("[TTS] HATA: chunk sonu (CRLF) okunamadi.");
+            return -1;
+        }
+    }
+
+    return static_cast<int>(total);
+}
 
 static void ttsPlaybackTask(void *parameter) {
     (void)parameter;
@@ -903,12 +977,29 @@ static void ttsPlaybackTask(void *parameter) {
         static_cast<unsigned int>(TTS_PREBUFFER_SIZE)
     );
 
+    unsigned long prebufferDebugAt = millis();
+
     while (
         xStreamBufferBytesAvailable(ttsStreamBuffer)
             < TTS_PREBUFFER_SIZE
         && !ttsStreamDone
         && !ttsPlaybackFailed
     ) {
+        if (millis() - prebufferDebugAt >= 1000) {
+            Serial.printf(
+                "[TTS-DEBUG] Tampon bekleniyor: %u / %u bayt | "
+                "Aktarim bitti: %d | Oynatma hatasi: %d\n",
+                static_cast<unsigned int>(
+                    xStreamBufferBytesAvailable(ttsStreamBuffer)
+                ),
+                static_cast<unsigned int>(TTS_PREBUFFER_SIZE),
+                static_cast<int>(ttsStreamDone),
+                static_cast<int>(ttsPlaybackFailed)
+            );
+
+            prebufferDebugAt = millis();
+        }
+
         vTaskDelay(pdMS_TO_TICKS(5));
     }
 
@@ -973,6 +1064,8 @@ static void ttsPlaybackTask(void *parameter) {
         }
 
         ttsPlayedBytes += received;
+        Serial.printf("[TTS-PLAY] Calinan toplam: %u bayt\n",
+                    static_cast<unsigned int>(ttsPlayedBytes));
     }
 
     if (hasCarry && !ttsPlaybackFailed) {
@@ -1136,21 +1229,27 @@ bool speakText(const String &text) {
         "PCM akis aktarimi basliyor; tampon doldukca ses calinacak."
     );
 
-    // HTTPClient chunked aktarim kodlamasini kendisi cozer.
-    // Cozulmus PCM baytlari TtsPcmStream araciligiyla tamponlanir.
-    TtsPcmStream pcmStream(ttsStreamBuffer);
+    Serial.println("[TTS-DEBUG] HTTP akis aktarimi basladi.");
 
-    int written = http.writeToStream(&pcmStream);
+    unsigned long transferStart = millis();
 
-    // HTTP aktarimi bitti; oynatma gorevi kalan veriyi tuketsin.
+    WiFiClient *netStream = http.getStreamPtr();
+
+    int written = (netStream != nullptr)
+        ? streamTtsBody(netStream, http.getSize())
+        : -1;
+
+    Serial.printf(
+        "[TTS-DEBUG] Aktarim bitti. Sure: %lu ms, bayt: %d, min bos heap: %u\n",
+        millis() - transferStart,
+        written,
+        static_cast<unsigned int>(ESP.getMinFreeHeap())
+    );
+
+    // Aktarim bitti; oynatma gorevi kalan veriyi tuketsin.
     ttsStreamDone = true;
 
     http.end();
-
-    Serial.printf(
-        "HTTP aktarim sonucu: %d bayt\n",
-        written
-    );
 
     while (!ttsPlaybackFinished) {
         vTaskDelay(pdMS_TO_TICKS(10));
