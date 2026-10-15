@@ -8,12 +8,22 @@
 #include <LittleFS.h>
 #include <ArduinoJson.h>
 #include "secrets.h"
+#include <cctype>
+#include <climits>
+#include <cstdlib>
 #include <cstring>
 #include <driver/i2s_std.h>
 #include <FluxGarage_RoboEyes.h>
 #include <ESP32Servo.h>
 #include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
 #include <freertos/stream_buffer.h>
+#include <vector>
+
+// ---------- Sure olcumu ----------
+static uint32_t tStart = 0;
+#define MARK(label) \
+  Serial.printf("[SURE] %s: %lu ms\n", label, (unsigned long)(millis() - tStart))
 
 // ---------- OLED ----------
 static constexpr int OLED_WIDTH = 128;
@@ -33,6 +43,7 @@ RoboEyes<Adafruit_SH1106G> roboEyes(display);
 
 bool setupOLED() {
   Wire.begin(OLED_SDA, OLED_SCL);
+  Wire.setClock(400000);
 
   if (!display.begin(0x3C, true)) {
     Serial.println("HATA: SH1106 OLED baslatilamadi.");
@@ -52,6 +63,74 @@ bool setupOLED() {
 
   Serial.println("OLED basariyla baslatildi.");
   return true;
+}
+
+// ---------- Goz durumlari ----------
+enum EyeState : uint8_t {
+  EYE_IDLE,        // bosta
+  EYE_LISTENING,   // dinliyor
+  EYE_THINKING,    // dusunuyor
+  EYE_SPEAKING     // konusuyor
+};
+
+static volatile EyeState eyeState = EYE_IDLE;
+
+// Yalnizca goz gorevi cagirir (RoboEyes nesnesine tek gorev dokunur).
+static void applyEyeState(EyeState s) {
+  switch (s) {
+    case EYE_IDLE:
+      roboEyes.setMood(DEFAULT);
+      roboEyes.setPosition(DEFAULT);
+      roboEyes.setCuriosity(OFF);
+      roboEyes.setIdleMode(ON, 5, 10);
+      roboEyes.setAutoblinker(ON, 3, 2);
+      roboEyes.open();
+      break;
+
+    case EYE_LISTENING:
+      roboEyes.setMood(DEFAULT);
+      roboEyes.setPosition(DEFAULT);
+      roboEyes.setIdleMode(OFF, 5, 10);
+      roboEyes.setCuriosity(ON);
+      roboEyes.open();
+      break;
+
+    case EYE_THINKING:
+      roboEyes.setMood(TIRED);
+      roboEyes.setPosition(NE);
+      roboEyes.setIdleMode(OFF, 5, 10);
+      roboEyes.setCuriosity(OFF);
+      break;
+
+    case EYE_SPEAKING:
+      roboEyes.setMood(HAPPY);
+      roboEyes.setPosition(DEFAULT);
+      roboEyes.setCuriosity(OFF);
+      roboEyes.setIdleMode(ON, 3, 6);
+      break;
+  }
+}
+
+static void eyeTask(void *parameter) {
+  (void)parameter;
+
+  EyeState applied = EYE_IDLE;
+
+  for (;;) {
+    EyeState wanted = eyeState;
+
+    if (wanted != applied) {
+      applied = wanted;
+      applyEyeState(wanted);
+    }
+
+    roboEyes.update();
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+static void startEyeTask() {
+  xTaskCreate(eyeTask, "Eyes", 5120, nullptr, 1, nullptr);
 }
 
 // ---------- Servo ----------
@@ -85,13 +164,51 @@ void setupTouch() {
     Serial.println("Touch sensor hazir.");
 }
 
+static constexpr unsigned long TOUCH_DEBOUNCE_MS = 40;
+static constexpr unsigned long TOUCH_LONG_PRESS_MS = 800;
+
+// Sik sik cagirin. pressed: yeni basildi, longPress: uzun basma tamamlandi (basista bir kez).
+static void pollTouch(bool &pressed, bool &longPress) {
+  static int lastRaw = LOW;
+  static int stable = LOW;
+  static unsigned long lastChange = 0;
+  static unsigned long pressStart = 0;
+  static bool longFired = false;
+
+  pressed = false;
+  longPress = false;
+
+  unsigned long now = millis();
+  int raw = digitalRead(TOUCH_PIN);
+
+  if (raw != lastRaw) {
+    lastRaw = raw;
+    lastChange = now;
+  }
+
+  if (now - lastChange >= TOUCH_DEBOUNCE_MS && raw != stable) {
+    stable = raw;
+
+    if (stable == HIGH) {
+      pressStart = now;
+      longFired = false;
+      pressed = true;
+    }
+  }
+
+  if (stable == HIGH && !longFired &&
+      now - pressStart >= TOUCH_LONG_PRESS_MS) {
+    longFired = true;
+    longPress = true;
+  }
+}
+
 // ---------- Mikrofon ----------
 static constexpr gpio_num_t I2S_BCLK = GPIO_NUM_14;
 static constexpr gpio_num_t I2S_WS   = GPIO_NUM_15;
 static constexpr gpio_num_t I2S_DIN  = GPIO_NUM_32;
 
 static constexpr uint32_t SAMPLE_RATE = 16000;
-static constexpr uint32_t RECORD_SECONDS = 3;
 static constexpr size_t BUFFER_SAMPLES = 256;
 
 static int32_t rawBuffer[BUFFER_SAMPLES];
@@ -150,7 +267,7 @@ bool setupMicrophone() {
 
   i2s_std_config_t config = {};
   config.clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE);
-  config.slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(
+  config.slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
       I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO);
 
   config.gpio_cfg.mclk = I2S_GPIO_UNUSED;
@@ -181,25 +298,116 @@ bool setupMicrophone() {
   return true;
 }
 
-bool recordWav() {
+void shutdownMicrophone() {
+  if (rxHandle != nullptr) {
+    i2s_channel_disable(rxHandle);
+    i2s_del_channel(rxHandle);
+    rxHandle = nullptr;
+  }
+}
+
+// ---------- Konusma algilama (VAD) ----------
+static constexpr uint32_t VAD_BLOCK_MS = BUFFER_SAMPLES * 1000 / SAMPLE_RATE;   // 16 ms
+static constexpr uint32_t VAD_FIRST_WAIT_MS = 6000;      // ilk tur: konusmaya baslama suresi
+static constexpr uint32_t VAD_FOLLOWUP_WAIT_MS = 5000;   // takip penceresi
+static constexpr uint32_t VAD_END_SILENCE_MS = 800;      // bu kadar sessizlik = bitti
+static constexpr uint32_t VAD_MAX_SPEECH_MS = 8000;
+static constexpr int VAD_MIN_THRESHOLD = 150;            // ortalama mutlak genlik
+static constexpr int VAD_MAX_THRESHOLD = 800;
+static constexpr float VAD_NOISE_FACTOR = 3.5f;
+static constexpr size_t VAD_PREROLL_BLOCKS = 8;          // ~128 ms geri tampon
+static constexpr size_t VAD_CAL_BLOCKS = 10;             // ~160 ms gurultu olcumu
+static constexpr size_t VAD_START_BLOCKS = 2;            // ust uste 2 blok esigi asarsa konusma
+static constexpr size_t VAD_TAIL_KEEP_BLOCKS = 8;        // sondaki sessizlikten ~128 ms birak
+static constexpr size_t VAD_MIN_SPEECH_BLOCKS = 10;      // ~160 ms'den kisa sesler gurultu sayilir
+
+enum VadResult { VAD_OK, VAD_NO_SPEECH, VAD_ERROR };
+
+// Kayittan sonra STT'ye gonderilecek gercek WAV boyutu (dosya daha buyuk kalabilir).
+static size_t recordedWavBytes = 0;
+
+static int16_t vadRing[VAD_PREROLL_BLOCKS][BUFFER_SAMPLES];
+static uint16_t vadRingLen[VAD_PREROLL_BLOCKS];
+static size_t vadRingHead = 0;
+static size_t vadRingCount = 0;
+
+static void vadRingPush(const int16_t *s, size_t n) {
+  memcpy(vadRing[vadRingHead], s, n * sizeof(int16_t));
+  vadRingLen[vadRingHead] = static_cast<uint16_t>(n);
+  vadRingHead = (vadRingHead + 1) % VAD_PREROLL_BLOCKS;
+  if (vadRingCount < VAD_PREROLL_BLOCKS) vadRingCount++;
+}
+
+// Halka tamponu eskiden yeniye dosyaya yazar. Yazilan ornek sayisi, hatada -1.
+static int32_t vadRingFlush(File &file) {
+  int32_t written = 0;
+  size_t idx = (vadRingHead + VAD_PREROLL_BLOCKS - vadRingCount) % VAD_PREROLL_BLOCKS;
+
+  for (size_t k = 0; k < vadRingCount; k++) {
+    size_t bytes = vadRingLen[idx] * sizeof(int16_t);
+
+    if (file.write(reinterpret_cast<uint8_t *>(vadRing[idx]), bytes) != bytes) {
+      return -1;
+    }
+
+    written += vadRingLen[idx];
+    idx = (idx + 1) % VAD_PREROLL_BLOCKS;
+  }
+
+  vadRingCount = 0;
+  return written;
+}
+
+static int blockLevel(const int16_t *s, size_t n) {
+  if (n == 0) return 0;
+
+  uint32_t sum = 0;
+  for (size_t i = 0; i < n; i++) {
+    sum += s[i] < 0 ? -static_cast<int32_t>(s[i]) : s[i];
+  }
+
+  return static_cast<int>(sum / n);
+}
+
+// Konusma baslayana kadar bekler, bitince (veya sessizlik suresi dolunca) kaydi sonlandirir.
+static VadResult recordUtterance(uint32_t waitForSpeechMs) {
   File file = LittleFS.open("/recording.wav", "w");
   if (!file) {
     Serial.println("HATA: WAV dosyasi acilamadi.");
-    return false;
+    return VAD_ERROR;
   }
 
   uint8_t blank[44] = {};
   if (file.write(blank, sizeof(blank)) != sizeof(blank)) {
     file.close();
-    return false;
+    return VAD_ERROR;
   }
 
-  const uint32_t targetSamples = SAMPLE_RATE * RECORD_SECONDS;
-  uint32_t totalSamples = 0;
+  vadRingHead = 0;
+  vadRingCount = 0;
 
-  Serial.println("\nMikrofona simdi konus. Kayit basladi.");
+  const uint32_t startMs = millis();
+  const size_t endSilenceBlocks = VAD_END_SILENCE_MS / VAD_BLOCK_MS;
+  const size_t maxSpeechBlocks = VAD_MAX_SPEECH_MS / VAD_BLOCK_MS;
 
-  while (totalSamples < targetSamples) {
+  uint32_t samplesWritten = 0;
+  bool speaking = false;
+  size_t calBlocks = 0, aboveRun = 0, silenceBlocks = 0, speechBlocks = 0;
+  uint32_t calSum = 0;
+  int noise = 0;
+  int startThr = VAD_MIN_THRESHOLD;
+  int endThr = VAD_MIN_THRESHOLD * 6 / 10;
+  int peakLevel = 0;
+
+  auto updateThresholds = [&]() {
+    startThr = constrain(static_cast<int>(noise * VAD_NOISE_FACTOR),
+                         VAD_MIN_THRESHOLD, VAD_MAX_THRESHOLD);
+    endThr = startThr * 6 / 10;
+  };
+
+  Serial.println("\n[VAD] Dinleniyor...");
+
+  while (true) {
     size_t bytesRead = 0;
 
     esp_err_t err = i2s_channel_read(
@@ -208,40 +416,135 @@ bool recordWav() {
     if (err != ESP_OK || bytesRead == 0) {
       Serial.printf("I2S okuma hatasi: %d\n", err);
       file.close();
-      return false;
+      return VAD_ERROR;
     }
 
     size_t count = bytesRead / sizeof(int32_t);
-    size_t remaining = targetSamples - totalSamples;
-    if (count > remaining) count = remaining;
 
     for (size_t i = 0; i < count; i++) {
-      pcmBuffer[i] = static_cast<int16_t>(rawBuffer[i] >> 14);
+      int32_t v = rawBuffer[i] >> 14;
+      pcmBuffer[i] = static_cast<int16_t>(constrain(v, -32768, 32767));
     }
 
-    size_t bytesToWrite = count * sizeof(int16_t);
-    if (file.write(reinterpret_cast<uint8_t *>(pcmBuffer),
-                   bytesToWrite) != bytesToWrite) {
+    int level = blockLevel(pcmBuffer, count);
+
+    // 1) Ortam gurultusunu olc.
+    if (calBlocks < VAD_CAL_BLOCKS) {
+      calSum += level;
+      calBlocks++;
+      vadRingPush(pcmBuffer, count);
+
+      if (calBlocks == VAD_CAL_BLOCKS) {
+        noise = static_cast<int>(calSum / calBlocks);
+        updateThresholds();
+        Serial.printf("[VAD] gurultu=%d esik=%d\n", noise, startThr);
+      }
+
+      continue;
+    }
+
+    // 2) Konusma baslamasini bekle.
+    if (!speaking) {
+      vadRingPush(pcmBuffer, count);
+
+      if (level > startThr) {
+        aboveRun++;
+      } else {
+        aboveRun = 0;
+        noise = (noise * 31 + level) / 32;   // gurultu tabanini yavasca guncelle
+        updateThresholds();
+      }
+
+      if (aboveRun >= VAD_START_BLOCKS) {
+        int32_t w = vadRingFlush(file);
+
+        if (w < 0) {
+          Serial.println("HATA: Ses verisi yazilamadi.");
+          file.close();
+          return VAD_ERROR;
+        }
+
+        samplesWritten += w;
+        speaking = true;
+        silenceBlocks = 0;
+        speechBlocks = 0;
+        peakLevel = 0;
+        Serial.println("[VAD] Konusma basladi.");
+      } else if (millis() - startMs > waitForSpeechMs) {
+        file.close();
+        return VAD_NO_SPEECH;
+      }
+
+      continue;
+    }
+
+    // 3) Konusuyor: kaydet, sessizlik sayacini izle.
+    size_t bytes = count * sizeof(int16_t);
+
+    if (file.write(reinterpret_cast<uint8_t *>(pcmBuffer), bytes) != bytes) {
       Serial.println("HATA: Ses verisi yazilamadi.");
       file.close();
-      return false;
+      return VAD_ERROR;
     }
 
-    totalSamples += count;
+    samplesWritten += count;
+    speechBlocks++;
+
+    if (level > peakLevel) peakLevel = level;
+
+    if (level < endThr) silenceBlocks++;
+    else silenceBlocks = 0;
+
+    if (silenceBlocks >= endSilenceBlocks || speechBlocks >= maxSpeechBlocks) {
+      size_t activeBlocks =
+          speechBlocks > silenceBlocks ? speechBlocks - silenceBlocks : 0;
+
+      if (activeBlocks < VAD_MIN_SPEECH_BLOCKS) {
+        // Cok kisa (tik, ofleme vb.): yok say, beklemeye don.
+        Serial.println("[VAD] Cok kisa ses; yok sayildi.");
+        file.seek(44);
+        samplesWritten = 0;
+        speaking = false;
+        aboveRun = 0;
+        silenceBlocks = 0;
+        speechBlocks = 0;
+        vadRingCount = 0;
+
+        if (millis() - startMs > waitForSpeechMs) {
+          file.close();
+          return VAD_NO_SPEECH;
+        }
+
+        continue;
+      }
+
+      break;
+    }
   }
 
-  uint32_t dataSize = totalSamples * sizeof(int16_t);
+  // Sondaki sessizligi kirp (yalnizca birkac blok birak).
+  size_t trimBlocks =
+      silenceBlocks > VAD_TAIL_KEEP_BLOCKS ? silenceBlocks - VAD_TAIL_KEEP_BLOCKS : 0;
+  uint32_t trimSamples = trimBlocks * BUFFER_SAMPLES;
+  if (trimSamples > samplesWritten) trimSamples = 0;
 
-  if (!file.seek(0) || !writeWavHeader(file, dataSize)) {
+  uint32_t dataBytes = (samplesWritten - trimSamples) * sizeof(int16_t);
+
+  if (!file.seek(0) || !writeWavHeader(file, dataBytes)) {
     Serial.println("HATA: WAV basligi yazilamadi.");
     file.close();
-    return false;
+    return VAD_ERROR;
   }
 
   file.close();
-  Serial.printf("WAV kaydi tamamlandi: %lu bayt\n",
-                static_cast<unsigned long>(dataSize + 44));
-  return true;
+  recordedWavBytes = dataBytes + 44;
+
+  Serial.printf("[VAD] Kayit bitti: %lu ms, tepe seviye=%d, dosya=%u bayt\n",
+                static_cast<unsigned long>(dataBytes / 32),
+                peakLevel,
+                static_cast<unsigned int>(recordedWavBytes));
+
+  return VAD_OK;
 }
 
 static const char BASE64_TABLE[] =
@@ -408,9 +711,9 @@ String transcribeAudio() {
         return "";
     }
 
-    size_t fileSize = wav.size();
+    size_t fileSize = recordedWavBytes;   // dosyada artik fazladan bayt kalmis olabilir
 
-    if (fileSize < 44 || fileSize > 200000) {
+    if (fileSize < 44 || fileSize > 300000 || fileSize > wav.size()) {
         Serial.printf(
             "HATA: WAV dosya boyutu gecersiz: %u bayt\n",
             (unsigned int)fileSize
@@ -451,7 +754,7 @@ String transcribeAudio() {
         wav.close();
         return "";
     }
-    
+
     const char *responseHeaders[] = {"Content-Type"};
     http.collectHeaders(responseHeaders, 1);
 
@@ -536,164 +839,9 @@ String transcribeAudio() {
     return transcript;
 }
 
-// ------------- Deepseek LLM ------------------
-
-String generateReply(const String &transcript) {
-    if (transcript.isEmpty()) {
-        Serial.println("HATA: LLM girdisi bos.");
-        return "";
-    }
-
-    Serial.println("\nOpenRouter DeepSeek LLM streaming baslatiliyor...");
-
-    WiFiClientSecure client;
-    client.setInsecure(); // Yalnizca prototip testi icin.
-
-    HTTPClient http;
-    http.setTimeout(15000);
-
-    const char *url =
-        "https://openrouter.ai/api/v1/chat/completions";
-
-    if (!http.begin(client, url)) {
-        Serial.println("HATA: OpenRouter LLM baglantisi baslatilamadi.");
-        return "";
-    }
-
-    http.addHeader(
-        "Authorization",
-        String("Bearer ") + OPENROUTER_API_KEY
-    );
-    http.addHeader("Content-Type", "application/json");
-    http.addHeader("Accept", "text/event-stream");
-
-    JsonDocument request;
-
-    request["model"] = "deepseek/deepseek-v4.1-flash";
-    request["stream"] = true;
-
-    JsonArray messages = request["messages"].to<JsonArray>();
-
-    JsonObject systemMessage = messages.add<JsonObject>();
-    systemMessage["role"] = "system";
-    systemMessage["content"] =
-        "Sen MasaDaş adinda fiziksel bir masaustu robotusun. "
-        "Turkce konus. Cevaplarini kisa ve dogal tut. "
-        "En fazla 1-2 cumle kullan. Gereksiz aciklama yapma. "
-        "Kullanicinin sorusuna dogrudan cevap ver. "
-        "Samimi ama abartisiz bir uslup kullan. Emoji kullanma.";
-
-    JsonObject userMessage = messages.add<JsonObject>();
-    userMessage["role"] = "user";
-    userMessage["content"] = transcript;
-
-    request["max_tokens"] = 400;
-    request["reasoning"]["enabled"] = false;
-    request["temperature"] = 0.7;
-
-    String requestBody;
-    serializeJson(request, requestBody);
-
-    Serial.println("DeepSeek streaming istegi gonderiliyor...");
-
-    int status = http.POST(requestBody);
-    Serial.printf("LLM HTTP durumu: %d\n", status);
-
-    if (status < 200 || status >= 300) {
-        Serial.println("OpenRouter LLM API hatasi:");
-        Serial.println(http.getString());
-        http.end();
-        return "";
-    }
-
-    WiFiClient *stream = http.getStreamPtr();
-
-    String reply;
-    String line;
-    bool streamFinished = false;
-    unsigned long lastDataTime = millis();
-
-    Serial.println("LLM parcalari geliyor:");
-
-    while (!streamFinished) {
-        while (stream->available() > 0) {
-            char c = static_cast<char>(stream->read());
-            lastDataTime = millis();
-
-            if (c != '\n') {
-                if (c != '\r') {
-                    line += c;
-                }
-                continue;
-            }
-
-            if (line.startsWith("data:")) {
-                String data = line.substring(5);
-                data.trim();
-
-                if (data == "[DONE]") {
-                    streamFinished = true;
-                    line = "";
-                    break;
-                }
-
-                if (!data.isEmpty()) {
-                    JsonDocument event;
-                    DeserializationError error =
-                        deserializeJson(event, data);
-
-                    if (!error) {
-                        if (event["error"].is<JsonObject>()) {
-                            Serial.println("\nLLM akis hatasi:");
-                            serializeJson(event["error"], Serial);
-                            Serial.println();
-                            http.end();
-                            return "";
-                        }
-
-                        const char *content =
-                            event["choices"][0]["delta"]["content"]
-                                | "";
-
-                        if (content[0] != '\0') {
-                            reply += content;
-                            Serial.print(content);
-                        }
-                    }
-                }
-            }
-
-            line = "";
-        }
-
-        if (streamFinished) {
-            break;
-        }
-
-        if (!http.connected() && stream->available() == 0) {
-            break;
-        }
-
-        if (millis() - lastDataTime > 15000) {
-            Serial.println("\nHATA: LLM akisinda zaman asimi.");
-            break;
-        }
-
-        delay(1);
-    }
-
-    http.end();
-    reply.trim();
-
-    Serial.println("\nLLM akisinin sonu.");
-
-    if (reply.isEmpty()) {
-        Serial.println("HATA: LLM yaniti bos veya akis tamamlanamadi.");
-        return "";
-    }
-
-    return reply;
-}
+// =====================================================================
+//  Hoparlor (I2S TX)
+// =====================================================================
 
 // MAX98357A pinleri
 static constexpr gpio_num_t TTS_BCLK = GPIO_NUM_14;
@@ -703,9 +851,7 @@ static constexpr gpio_num_t TTS_DOUT = GPIO_NUM_23;
 static constexpr uint32_t TTS_SAMPLE_RATE = 24000;
 static constexpr float TTS_VOLUME = 0.3f;   // 0.0 - 1.0
 
-// 4096 Base64 karakteri -> en fazla 3072 ses bayti.
-// Global tamponlar, stack tasmasi riskini azaltir.
-static uint8_t ttsPcmBytes[3072];
+// playPcmChunk icin: 1536 ornek (3072 bayt) -> stereo 32 bit.
 static int32_t ttsI2sBuffer[3072];
 
 static i2s_chan_handle_t txHandle = nullptr;
@@ -767,6 +913,22 @@ bool setupSpeaker() {
   return true;
 }
 
+// Kapanista kisa sessizlik yazip kanali kapatir (tik sesini onler).
+void shutdownSpeaker() {
+  if (txHandle == nullptr) return;
+
+  memset(ttsI2sBuffer, 0, sizeof(ttsI2sBuffer));
+  for (int i = 0; i < 3; i++) {
+    size_t w = 0;
+    i2s_channel_write(txHandle, ttsI2sBuffer, sizeof(ttsI2sBuffer), &w, 1000);
+  }
+  delay(100);
+
+  i2s_channel_disable(txHandle);
+  i2s_del_channel(txHandle);
+  txHandle = nullptr;
+}
+
 // Mono 16-bit PCM sesini stereo 32-bit I2S formatina aktar.
 bool playPcmChunk(const uint8_t *pcm, size_t pcmLength) {
   size_t sampleCount = pcmLength / 2;
@@ -815,36 +977,55 @@ bool playPcmChunk(const uint8_t *pcm, size_t pcmLength) {
   return true;
 }
 
-// ---------- TTS akisli oynatma altyapisi ----------
+// =====================================================================
+//  Ses hatti: ortak durum
+// =====================================================================
 
 static constexpr size_t TTS_STREAM_BUFFER_SIZE = 32768;
 static constexpr size_t TTS_PREBUFFER_SIZE = 4096;
+static constexpr uint32_t TTS_WORKER_STACK = 12288;   // TLS icin genis yigin
+static constexpr UBaseType_t TTS_QUEUE_LENGTH = 16;
+
+static constexpr size_t SENTENCE_MIN_CHARS = 12;
+static constexpr size_t SENTENCE_MAX_CHARS = 180;
 
 static StreamBufferHandle_t ttsStreamBuffer = nullptr;
+static QueueHandle_t ttsSentenceQueue = nullptr;   // char* (nullptr = bitis)
 
-static volatile bool ttsStreamDone = false;
+static volatile bool ttsStreamDone = false;        // tum PCM tampona yazildi
+static volatile bool ttsWorkerFinished = false;
 static volatile bool ttsPlaybackFinished = false;
 static volatile bool ttsPlaybackFailed = false;
-
-static volatile uint32_t ttsEmptyReadCount = 0;
-static volatile uint32_t ttsLowBufferCount = 0;
-static volatile uint32_t ttsMaxEmptyWaitMs = 0;
-static volatile size_t ttsMinBufferBytes = SIZE_MAX;
-
 static volatile size_t ttsPlayedBytes = 0;
+static bool ttsFirstSentenceMarked = false;
+static std::vector<String> sentenceBacklog;   // LLM bitene kadar biriken cümleler
 
 static uint8_t ttsPlaybackBuffer[3074];
-
-// ---------- Elle chunked okuma ----------
-
 static uint8_t ttsNetBuffer[1024];
+static volatile bool speechAbort = false;
+
+// Konusma sirasinda dokunma = soz kesme.
+static void checkBargeIn() {
+    bool pressed = false, longPress = false;
+    pollTouch(pressed, longPress);
+
+    if (pressed && !speechAbort) {
+        speechAbort = true;
+        ttsPlaybackFailed = true;   // oynatici ve isci hemen durur
+        Serial.println("[AKIS] Dokunma: konusma kesildi.");
+    }
+}
+
+// =====================================================================
+//  Tampona yazma ve elle chunked okuma
+// =====================================================================
 
 // Veriyi akis tamponuna yazar; tampon doluysa bekler.
 static bool pushToTtsBuffer(const uint8_t *data, size_t length) {
     size_t sent = 0;
 
     while (sent < length) {
-        if (ttsPlaybackFailed) return false;
+        if (ttsPlaybackFailed || ttsPlaybackFinished) return false;
 
         sent += xStreamBufferSend(
             ttsStreamBuffer,
@@ -864,6 +1045,8 @@ static bool readHttpLine(WiFiClient *c, char *out, size_t cap,
     uint32_t last = millis();
 
     while (millis() - last < timeoutMs) {
+        if (ttsPlaybackFailed) return false;
+
         if (c->available() > 0) {
             int v = c->read();
             if (v < 0) continue;
@@ -894,6 +1077,8 @@ static bool pumpBytes(WiFiClient *c, size_t count, uint32_t timeoutMs,
     uint32_t last = millis();
 
     while (count > 0) {
+        if (ttsPlaybackFailed) return false;
+
         int avail = c->available();
 
         if (avail > 0) {
@@ -922,17 +1107,17 @@ static bool pumpBytes(WiFiClient *c, size_t count, uint32_t timeoutMs,
 }
 
 // HTTP govdesini (chunked veya sabit uzunluk) akis tamponuna aktarir.
-// Basarida toplam bayt sayisini, hatada -1 dondurur.
-static int streamTtsBody(WiFiClient *c, int contentLength) {
+// `total`, hata olsa bile tampona yazilan bayt sayisini verir.
+static bool streamTtsBody(WiFiClient *c, int contentLength, size_t &total) {
     constexpr uint32_t STEP_TIMEOUT_MS = 15000;
-    size_t total = 0;
+    total = 0;
 
     if (contentLength >= 0) {
         if (!pumpBytes(c, contentLength, STEP_TIMEOUT_MS, total)) {
             Serial.println("[TTS] HATA: govde okunamadi.");
-            return -1;
+            return false;
         }
-        return static_cast<int>(total);
+        return true;
     }
 
     char line[24];
@@ -941,198 +1126,385 @@ static int streamTtsBody(WiFiClient *c, int contentLength) {
         if (!readHttpLine(c, line, sizeof(line), STEP_TIMEOUT_MS)) {
             Serial.printf("[TTS] HATA: chunk basligi okunamadi (alinan: %u).\n",
                           static_cast<unsigned int>(total));
-            return -1;
+            return false;
         }
+
+        if (line[0] == '\0') continue;
 
         size_t chunkSize = strtoul(line, nullptr, 16);
 
         if (chunkSize == 0) {
-            if (line[0] == '\0') continue;   // bos satir, atla
-            break;                           // "0" = akisin sonu
+            // Akisin sonu: kapanistaki bos satiri tuket (baglanti yeniden kullanilabilsin).
+            readHttpLine(c, line, sizeof(line), 2000);
+            return true;
         }
 
         if (!pumpBytes(c, chunkSize, STEP_TIMEOUT_MS, total)) {
             Serial.printf("[TTS] HATA: chunk verisi eksik (alinan: %u).\n",
                           static_cast<unsigned int>(total));
-            return -1;
+            return false;
         }
 
         // Chunk sonundaki CRLF.
         if (!readHttpLine(c, line, sizeof(line), STEP_TIMEOUT_MS)) {
             Serial.println("[TTS] HATA: chunk sonu (CRLF) okunamadi.");
-            return -1;
+            return false;
         }
     }
-
-    return static_cast<int>(total);
 }
+
+// =====================================================================
+//  Oynatma gorevi
+// =====================================================================
 
 static void ttsPlaybackTask(void *parameter) {
     (void)parameter;
 
-    Serial.println("[TTS-DEBUG] Oynatma gorevi basladi.");
-
-    Serial.printf(
-        "[TTS-DEBUG] Baslangic tamponu bekleniyor: %u bayt\n",
-        static_cast<unsigned int>(TTS_PREBUFFER_SIZE)
-    );
-
-    unsigned long prebufferDebugAt = millis();
-
+    // Ilk ses icin yeterli veri birikene (veya akis bitene) kadar bekle.
     while (
-        xStreamBufferBytesAvailable(ttsStreamBuffer)
-            < TTS_PREBUFFER_SIZE
+        xStreamBufferBytesAvailable(ttsStreamBuffer) < TTS_PREBUFFER_SIZE
         && !ttsStreamDone
         && !ttsPlaybackFailed
     ) {
-        if (millis() - prebufferDebugAt >= 1000) {
-            Serial.printf(
-                "[TTS-DEBUG] Tampon bekleniyor: %u / %u bayt | "
-                "Aktarim bitti: %d | Oynatma hatasi: %d\n",
-                static_cast<unsigned int>(
-                    xStreamBufferBytesAvailable(ttsStreamBuffer)
-                ),
-                static_cast<unsigned int>(TTS_PREBUFFER_SIZE),
-                static_cast<int>(ttsStreamDone),
-                static_cast<int>(ttsPlaybackFailed)
-            );
-
-            prebufferDebugAt = millis();
-        }
-
         vTaskDelay(pdMS_TO_TICKS(5));
     }
 
-    if (ttsPlaybackFailed) {
-        ttsPlaybackFinished = true;
-        vTaskDelete(nullptr);
-        return;
-    }
+    if (!ttsPlaybackFailed) {
+        MARK("ilk ses");
+        eyeState = EYE_SPEAKING;
 
-    Serial.printf(
-        "[TTS-DEBUG] Oynatma basliyor. Tampondaki veri: %u bayt\n",
-        static_cast<unsigned int>(
-            xStreamBufferBytesAvailable(ttsStreamBuffer)
-        )
-    );
+        bool hasCarry = false;
+        uint8_t carry = 0;
 
-    bool hasCarry = false;
-    uint8_t carry = 0;
+        while (!ttsPlaybackFailed) {
+            size_t received = xStreamBufferReceive(
+                ttsStreamBuffer,
+                ttsPlaybackBuffer + (hasCarry ? 1 : 0),
+                3072 - (hasCarry ? 1 : 0),
+                pdMS_TO_TICKS(100)
+            );
 
-    while (!ttsPlaybackFailed) {
-        size_t received = xStreamBufferReceive(
-            ttsStreamBuffer,
-            ttsPlaybackBuffer + (hasCarry ? 1 : 0),
-            3072 - (hasCarry ? 1 : 0),
-            pdMS_TO_TICKS(100)
-        );
+            if (hasCarry) {
+                ttsPlaybackBuffer[0] = carry;
+                received += 1;
+                hasCarry = false;
+            }
 
-        if (hasCarry) {
-            ttsPlaybackBuffer[0] = carry;
-            received += 1;
-            hasCarry = false;
-        }
+            if (received == 0) {
+                if (
+                    ttsStreamDone
+                    && xStreamBufferBytesAvailable(ttsStreamBuffer) == 0
+                ) {
+                    break;
+                }
 
-        if (received == 0) {
-            if (
-                ttsStreamDone
-                && xStreamBufferBytesAvailable(ttsStreamBuffer) == 0
-            ) {
+                continue;
+            }
+
+            if (received % 2 != 0) {
+                carry = ttsPlaybackBuffer[received - 1];
+                hasCarry = true;
+                received--;
+            }
+
+            if (received == 0) {
+                continue;
+            }
+
+            if (!playPcmChunk(ttsPlaybackBuffer, received)) {
+                Serial.println("[TTS] HATA: playPcmChunk basarisiz.");
+                ttsPlaybackFailed = true;
                 break;
             }
 
-            continue;
+            ttsPlayedBytes += received;
         }
-
-        if (received % 2 != 0) {
-            carry = ttsPlaybackBuffer[received - 1];
-            hasCarry = true;
-            received--;
-        }
-
-        if (received == 0) {
-            continue;
-        }
-
-        if (!playPcmChunk(ttsPlaybackBuffer, received)) {
-            Serial.println(
-                "[TTS-DEBUG] HATA: playPcmChunk basarisiz."
-            );
-
-            ttsPlaybackFailed = true;
-            break;
-        }
-
-        ttsPlayedBytes += received;
-        Serial.printf("[TTS-PLAY] Calinan toplam: %u bayt\n",
-                    static_cast<unsigned int>(ttsPlayedBytes));
     }
 
-    if (hasCarry && !ttsPlaybackFailed) {
-        Serial.println(
-            "[TTS-DEBUG] HATA: PCM verisinde tek bayt kaldi."
-        );
-
-        ttsPlaybackFailed = true;
-    }
-
-
     Serial.printf(
-        "[TTS-METRIK] Bos okuma sayisi: %lu\n",
-        static_cast<unsigned long>(ttsEmptyReadCount)
-    );
-
-    Serial.printf(
-        "[TTS-METRIK] Dusuk tampon sayisi: %lu\n",
-        static_cast<unsigned long>(ttsLowBufferCount)
-    );
-
-    Serial.printf(
-        "[TTS-METRIK] En dusuk tampon: %u bayt\n",
-        static_cast<unsigned int>(ttsMinBufferBytes)
-    );
-
-    Serial.printf(
-        "[TTS-METRIK] En uzun bos bekleme: %lu ms\n",
-        static_cast<unsigned long>(ttsMaxEmptyWaitMs)
-    );
-
-    Serial.printf(
-        "[TTS-DEBUG] Oynatma gorevi bitti. Calinan veri: %u bayt\n",
+        "[TTS] Oynatma bitti. Calinan veri: %u bayt\n",
         static_cast<unsigned int>(ttsPlayedBytes)
     );
 
     ttsPlaybackFinished = true;
     vTaskDelete(nullptr);
 }
- 
-bool speakText(const String &text) {
-    if (text.isEmpty()) {
-        Serial.println("HATA: TTS metni bos.");
+
+// =====================================================================
+//  TTS iscisi: kuyruktaki cumleleri sirayla seslendirir
+// =====================================================================
+
+// Donus: 1 = tamam, 0 = kalici hata, -1 = baglanti hatasi (yeniden denenebilir)
+static int ttsSynthesizeSentence(HTTPClient &http,
+                                 WiFiClientSecure &client,
+                                 const char *text) {
+    if (!http.begin(client, "https://openrouter.ai/api/v1/audio/speech")) {
+        return -1;
+    }
+
+    http.addHeader("Authorization", String("Bearer ") + OPENROUTER_API_KEY);
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("Accept", "audio/pcm");
+
+    JsonDocument request;
+    request["model"] = "elevenlabs/eleven-flash-v2.5";
+    request["input"] = text;
+    request["voice"] = "bella";
+    request["response_format"] = "pcm";
+    request["provider"]["options"]["elevenlabs"]["language_code"] = "tr";
+
+    String body;
+    serializeJson(request, body);
+
+    int status = http.POST(body);
+
+    if (status < 0) {
+        Serial.printf("[TTS] Baglanti hatasi: %s\n",
+                      http.errorToString(status).c_str());
+        http.end();
+        return -1;
+    }
+
+    if (status < 200 || status >= 300) {
+        Serial.printf("[TTS] HTTP hatasi: %d\n", status);
+        Serial.println(http.getString());
+        http.end();
+        client.stop();
+        return 0;
+    }
+
+    size_t total = 0;
+    WiFiClient *net = http.getStreamPtr();
+    bool ok = (net != nullptr) && streamTtsBody(net, http.getSize(), total);
+
+    http.end();
+    if (!ok) client.stop();
+
+    // Cumleler arasi hizalama: tek bayt kalirsa sifirla tamamla.
+    if (total % 2 != 0) {
+        uint8_t pad = 0;
+        pushToTtsBuffer(&pad, 1);
+    }
+
+    Serial.printf("[TTS] Cumle aktarildi: %u bayt\n",
+                  static_cast<unsigned int>(total));
+
+    return ok ? 1 : 0;
+}
+
+// Nesneler burada olusup yok olur (vTaskDelete destructor calistirmaz).
+static void ttsWorkerRun() {
+    WiFiClientSecure client;
+    client.setInsecure();   // Yalnizca prototip.
+
+    HTTPClient http;        // Tum cumleler icin ayni nesne: baglanti yeniden kullanilir.
+    http.setTimeout(30000);
+    http.setReuse(true);
+
+    while (true) {
+        char *sentence = nullptr;
+        xQueueReceive(ttsSentenceQueue, &sentence, portMAX_DELAY);
+
+        if (sentence == nullptr) break;   // bitis isareti
+
+        if (!ttsPlaybackFailed) {
+            int r = ttsSynthesizeSentence(http, client, sentence);
+
+            if (r < 0) {
+                // Eski baglanti kopmus olabilir; temiz baglantiyla bir kez daha dene.
+                client.stop();
+                r = ttsSynthesizeSentence(http, client, sentence);
+            }
+
+            if (r != 1  && !speechAbort) {
+                Serial.println("[TTS] UYARI: cumle seslendirilemedi.");
+            }
+        }
+
+        free(sentence);
+    }
+}
+
+static void ttsWorkerTask(void *parameter) {
+    (void)parameter;
+
+    ttsWorkerRun();
+
+    ttsStreamDone = true;
+    ttsWorkerFinished = true;
+    vTaskDelete(nullptr);
+}
+
+// =====================================================================
+//  Cumle ayirma
+// =====================================================================
+
+static void enqueueSentence(const String &s) {
+    if (!ttsFirstSentenceMarked) {
+        ttsFirstSentenceMarked = true;
+        MARK("ilk cumle");
+    }
+
+    Serial.printf("[TTS-KUYRUK] %s\n", s.c_str());
+    sentenceBacklog.push_back(s);
+}
+
+// `pending` icindeki tamamlanmis cumleleri kuyruga yollar.
+// Cumle sonu: . ! ? (ardindan bosluk) veya satir sonu.
+static void flushSentences(String &pending, bool finalFlush) {
+    while (true) {
+        int n = pending.length();
+        int cut = -1;
+
+        for (int i = 0; i < n; i++) {
+            char ch = pending[i];
+
+            if (ch == '\n') {
+                cut = i + 1;
+                break;
+            }
+
+            if (ch == '.' || ch == '!' || ch == '?') {
+                int j = i + 1;
+
+                while (j < n && (pending[j] == '"' ||
+                                 pending[j] == '\'' ||
+                                 pending[j] == ')')) {
+                    j++;
+                }
+
+                if (j >= n) break;   // sonraki karakter henuz gelmedi
+
+                if (isspace(static_cast<unsigned char>(pending[j])) &&
+                    j >= static_cast<int>(SENTENCE_MIN_CHARS)) {
+                    cut = j;
+                    break;
+                }
+            }
+        }
+
+        // Cok uzun cumle: son bosluktan bol.
+        if (cut < 0 && n > static_cast<int>(SENTENCE_MAX_CHARS)) {
+            int sp = pending.lastIndexOf(' ', SENTENCE_MAX_CHARS);
+            if (sp > static_cast<int>(SENTENCE_MIN_CHARS)) cut = sp;
+        }
+
+        if (cut < 0) break;
+
+        String s = pending.substring(0, cut);
+        pending.remove(0, cut);
+        s.trim();
+
+        if (s.length() > 0) enqueueSentence(s);
+    }
+
+    if (finalFlush) {
+        pending.trim();
+        if (pending.length() > 0) enqueueSentence(pending);
+        pending = "";
+    }
+}
+
+// =====================================================================
+//  Ses hattinin kurulumu ve kapanisi
+// =====================================================================
+
+static void releaseSpeechResources() {
+    if (ttsSentenceQueue != nullptr) {
+        char *leftover = nullptr;
+        while (xQueueReceive(ttsSentenceQueue, &leftover, 0) == pdTRUE) {
+            free(leftover);
+        }
+        vQueueDelete(ttsSentenceQueue);
+        ttsSentenceQueue = nullptr;
+    }
+
+    if (ttsStreamBuffer != nullptr) {
+        vStreamBufferDelete(ttsStreamBuffer);
+        ttsStreamBuffer = nullptr;
+    }
+
+    shutdownSpeaker();
+}
+
+static bool startSpeechPipeline() {
+    if (!setupSpeaker()) return false;
+
+    ttsStreamBuffer = xStreamBufferCreate(TTS_STREAM_BUFFER_SIZE, 1);
+    ttsSentenceQueue = xQueueCreate(TTS_QUEUE_LENGTH, sizeof(char *));
+
+    if (ttsStreamBuffer == nullptr || ttsSentenceQueue == nullptr) {
+        Serial.println("HATA: TTS tamponu/kuyrugu olusturulamadi.");
+        releaseSpeechResources();
         return false;
     }
 
-    if (String(OPENROUTER_API_KEY).isEmpty()) {
-        Serial.println("HATA: OpenRouter API anahtari bos.");
+    ttsStreamDone = false;
+    ttsWorkerFinished = false;
+    ttsPlaybackFinished = false;
+    ttsPlaybackFailed = false;
+    ttsPlayedBytes = 0;
+
+    if (xTaskCreate(ttsPlaybackTask, "TtsPlayback", 4096,
+                    nullptr, 2, nullptr) != pdPASS) {
+        Serial.println("HATA: Oynatma gorevi olusturulamadi.");
+        releaseSpeechResources();
         return false;
     }
 
-    Serial.println(
-        "\nOpenRouter ElevenLabs Flash v2.5 TTS baslatiliyor..."
-    );
+    return true;
+}
+
+// Isci ve oynatma gorevlerinin bitmesini bekler, kaynaklari serbest birakir.
+static bool finishSpeechPipeline(bool workerStarted) {
+    if (workerStarted) {
+        char *endMarker = nullptr;
+        xQueueSend(ttsSentenceQueue, &endMarker, portMAX_DELAY);
+
+        while (!ttsWorkerFinished) {
+            checkBargeIn();
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    } else {
+        ttsStreamDone = true;
+    }
+
+    while (!ttsPlaybackFinished) {
+        checkBargeIn();
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    bool ok = !ttsPlaybackFailed && ttsPlayedBytes > 0;
+
+    releaseSpeechResources();
+
+    Serial.printf("[HEAP] En dusuk bos heap: %u bayt\n",
+                  static_cast<unsigned int>(ESP.getMinFreeHeap()));
+
+    return ok;
+}
+
+// =====================================================================
+//  LLM (stream) -> cumleler -> TTS kuyrugu
+// =====================================================================
+
+// Baglanti nesneleri bu fonksiyon bitince yok olur (TLS bellegi erken serbest kalir).
+  static bool streamLlmToSpeech(const String &transcript,
+                                String &reply) {
+
+    Serial.println("\nOpenRouter DeepSeek LLM streaming baslatiliyor...");
 
     WiFiClientSecure client;
-    client.setInsecure();
+    client.setInsecure(); // Yalnizca prototip testi icin.
 
     HTTPClient http;
-    http.setTimeout(60000);
-    http.setReuse(false);
+    http.setTimeout(15000);
 
     const char *url =
-        "https://openrouter.ai/api/v1/audio/speech";
+        "https://openrouter.ai/api/v1/chat/completions";
 
     if (!http.begin(client, url)) {
-        Serial.println("HATA: TTS API baglantisi baslatilamadi.");
+        Serial.println("HATA: OpenRouter LLM baglantisi baslatilamadi.");
         return false;
     }
 
@@ -1141,155 +1513,301 @@ bool speakText(const String &text) {
         String("Bearer ") + OPENROUTER_API_KEY
     );
     http.addHeader("Content-Type", "application/json");
-    http.addHeader("Accept", "audio/pcm");
+    http.addHeader("Accept", "text/event-stream");
 
     JsonDocument request;
 
-    request["model"] = "elevenlabs/eleven-flash-v2.5";
-    request["input"] = text;
-    request["voice"] = "bella";
-    request["response_format"] = "pcm";
-    request["provider"]["options"]["elevenlabs"]["language_code"]
-        = "tr";
+    request["model"] = "deepseek/deepseek-v4.1-flash";
+    request["stream"] = true;
+
+    JsonArray messages = request["messages"].to<JsonArray>();
+
+    JsonObject systemMessage = messages.add<JsonObject>();
+    systemMessage["role"] = "system";
+    systemMessage["content"] =
+        "Sen MasaDaş adinda fiziksel bir masaustu robotusun. "
+        "Turkce konus. Cevaplarini kisa ve dogal tut. "
+        "En fazla 1-2 cumle kullan. Gereksiz aciklama yapma. "
+        "Kullanicinin sorusuna dogrudan cevap ver. "
+        "Samimi ama abartisiz bir uslup kullan. Emoji kullanma. "
+        "Sayilari rakamla degil yaziyla yaz (ornek: yirmi uc).";
+
+    JsonObject userMessage = messages.add<JsonObject>();
+    userMessage["role"] = "user";
+    userMessage["content"] = transcript;
+
+    request["max_tokens"] = 400;
+    request["reasoning"]["enabled"] = false;
+    request["temperature"] = 0.7;
 
     String requestBody;
     serializeJson(request, requestBody);
 
-    Serial.println("TTS istegi gonderiliyor...");
+    Serial.println("DeepSeek streaming istegi gonderiliyor...");
 
     int status = http.POST(requestBody);
-
-    Serial.printf("TTS HTTP durumu: %d\n", status);
+    Serial.printf("LLM HTTP durumu: %d\n", status);
 
     if (status < 200 || status >= 300) {
-        Serial.println("TTS API hata cevabi:");
+        Serial.println("OpenRouter LLM API hatasi:");
         Serial.println(http.getString());
-
         http.end();
         return false;
     }
 
-    Serial.printf(
-        "TTS yanit boyutu: %d bayt (-1 = chunked)\n",
-        http.getSize()
-    );
+    WiFiClient *stream = http.getStreamPtr();
 
-    // Hoparloru ve akis tamponunu hazirla.
-    if (!setupSpeaker()) {
-        http.end();
-        return false;
+    String line;
+    String pending;
+    bool streamFinished = false;
+    bool llmFailed = false;
+    unsigned long lastDataTime = millis();
+
+    while (!streamFinished) {
+        checkBargeIn();
+        if (speechAbort) break;
+
+        while (stream->available() > 0) {
+            char c = static_cast<char>(stream->read());
+            lastDataTime = millis();
+
+            if (c != '\n') {
+                if (c != '\r') {
+                    line += c;
+                }
+                continue;
+            }
+
+            if (line.startsWith("data:")) {
+                String data = line.substring(5);
+                data.trim();
+
+                if (data == "[DONE]") {
+                    streamFinished = true;
+                    line = "";
+                    break;
+                }
+
+                if (!data.isEmpty()) {
+                    JsonDocument event;
+                    DeserializationError error =
+                        deserializeJson(event, data);
+
+                    if (!error) {
+                        if (event["error"].is<JsonObject>()) {
+                            Serial.println("\nLLM akis hatasi:");
+                            serializeJson(event["error"], Serial);
+                            Serial.println();
+                            llmFailed = true;
+                            streamFinished = true;
+                            line = "";
+                            break;
+                        }
+
+                        const char *content =
+                            event["choices"][0]["delta"]["content"]
+                                | "";
+
+                        if (content[0] != '\0') {
+                            reply += content;
+                            pending += content;
+                            flushSentences(pending, false);
+                        }
+                    }
+                }
+            }
+
+            line = "";
+        }
+
+        if (streamFinished) {
+            break;
+        }
+
+        if (!http.connected() && stream->available() == 0) {
+            break;
+        }
+
+        if (millis() - lastDataTime > 15000) {
+            Serial.println("\nHATA: LLM akisinda zaman asimi.");
+            break;
+        }
+
+        delay(1);
     }
-
-    ttsStreamBuffer = xStreamBufferCreate(
-        TTS_STREAM_BUFFER_SIZE,
-        1
-    );
-
-    if (ttsStreamBuffer == nullptr) {
-        Serial.println("HATA: TTS akis tamponu olusturulamadi.");
-
-        i2s_channel_disable(txHandle);
-        i2s_del_channel(txHandle);
-        txHandle = nullptr;
-
-        http.end();
-        return false;
-    }
-
-    ttsStreamDone = false;
-    ttsPlaybackFinished = false;
-    ttsPlaybackFailed = false;
-    ttsPlayedBytes = 0;
-
-    // Oynatma gorevini, HTTP verisi gelmeden once baslat.
-    BaseType_t taskCreated = xTaskCreate(
-        ttsPlaybackTask,
-        "TtsPlayback",
-        4096,
-        nullptr,
-        2,
-        nullptr
-    );
-
-    if (taskCreated != pdPASS) {
-        Serial.println("HATA: TTS oynatma gorevi olusturulamadi.");
-
-        vStreamBufferDelete(ttsStreamBuffer);
-        ttsStreamBuffer = nullptr;
-
-        i2s_channel_disable(txHandle);
-        i2s_del_channel(txHandle);
-        txHandle = nullptr;
-
-        http.end();
-        return false;
-    }
-
-    Serial.println(
-        "PCM akis aktarimi basliyor; tampon doldukca ses calinacak."
-    );
-
-    Serial.println("[TTS-DEBUG] HTTP akis aktarimi basladi.");
-
-    unsigned long transferStart = millis();
-
-    WiFiClient *netStream = http.getStreamPtr();
-
-    int written = (netStream != nullptr)
-        ? streamTtsBody(netStream, http.getSize())
-        : -1;
-
-    Serial.printf(
-        "[TTS-DEBUG] Aktarim bitti. Sure: %lu ms, bayt: %d, min bos heap: %u\n",
-        millis() - transferStart,
-        written,
-        static_cast<unsigned int>(ESP.getMinFreeHeap())
-    );
-
-    // Aktarim bitti; oynatma gorevi kalan veriyi tuketsin.
-    ttsStreamDone = true;
 
     http.end();
 
-    while (!ttsPlaybackFinished) {
-        vTaskDelay(pdMS_TO_TICKS(10));
+    // Kalan metni de seslendir (soz kesilmediyse).
+    if (!speechAbort) flushSentences(pending, true);
+    reply.trim();
+
+    return !llmFailed && !reply.isEmpty();
+}
+
+// Cumleyi isci gorevin kuyruguna koyar; kuyruk doluysa bekler.
+static bool sendSentenceToWorker(const String &s) {
+    char *copy = strdup(s.c_str());
+    if (copy == nullptr) return false;
+
+    while (xQueueSend(ttsSentenceQueue, &copy, pdMS_TO_TICKS(50)) != pdTRUE) {
+        checkBargeIn();
+
+        if (speechAbort) {
+            free(copy);
+            return false;
+        }
     }
-
-    size_t playedBytes = ttsPlayedBytes;
-    bool playbackFailed = ttsPlaybackFailed;
-
-    vStreamBufferDelete(ttsStreamBuffer);
-    ttsStreamBuffer = nullptr;
-
-    if (txHandle != nullptr) {
-        i2s_channel_disable(txHandle);
-        i2s_del_channel(txHandle);
-        txHandle = nullptr;
-    }
-
-    if (written <= 0 || playbackFailed || playedBytes == 0) {
-        Serial.println("HATA: Akisli TTS tamamlanamadi.");
-        return false;
-    }
-
-    if (static_cast<size_t>(written) != playedBytes) {
-        Serial.printf(
-            "UYARI: Aktarilan ve calinan bayt sayisi farkli. "
-            "Aktarilan=%d, calinan=%u\n",
-            written,
-            static_cast<unsigned int>(playedBytes)
-        );
-        return false;
-    }
-
-    Serial.printf(
-        "Akisli oynatma tamamlandi: %u bayt\n",
-        static_cast<unsigned int>(playedBytes)
-    );
-
-    Serial.println("OpenRouter ElevenLabs TTS tamamlandi.");
 
     return true;
+}
+
+// Once LLM yaniti okunur ve baglantisi kapatilir; sonra cumleler seslendirilir.
+bool respondToTranscript(const String &transcript) {
+    if (transcript.isEmpty()) {
+        Serial.println("HATA: LLM girdisi bos.");
+        return false;
+    }
+
+    speechAbort = false;
+    ttsPlaybackFailed = false;
+    ttsFirstSentenceMarked = false;
+    sentenceBacklog.clear();
+
+    String reply;
+    bool llmOk = streamLlmToSpeech(transcript, reply);   // LLM baglantisi burada kapanir
+
+    Serial.println("\n========== MASADAS YANITI ==========");
+    Serial.println(reply);
+    Serial.println("====================================");
+
+    MARK("LLM bitti");
+
+    if (speechAbort) {
+        sentenceBacklog.clear();
+        return true;   // Soz kesildi; cagiran taraf dinlemeye gecer.
+    }
+
+    if (sentenceBacklog.empty()) {
+        return false;
+    }
+
+    Serial.printf("[HEAP] TTS oncesi bos: %u bayt, en buyuk blok: %u bayt\n",
+                  static_cast<unsigned int>(ESP.getFreeHeap()),
+                  static_cast<unsigned int>(ESP.getMaxAllocHeap()));
+
+    if (!startSpeechPipeline()) {
+        Serial.println("HATA: Ses hatti baslatilamadi.");
+        sentenceBacklog.clear();
+        return false;
+    }
+
+    bool workerStarted = xTaskCreate(ttsWorkerTask, "TtsWorker",
+                                     TTS_WORKER_STACK, nullptr, 1,
+                                     nullptr) == pdPASS;
+
+    if (!workerStarted) {
+        Serial.println("HATA: TTS isci gorevi olusturulamadi.");
+        finishSpeechPipeline(false);
+        sentenceBacklog.clear();
+        return false;
+    }
+
+    for (const String &s : sentenceBacklog) {
+        if (!sendSentenceToWorker(s)) break;
+    }
+    sentenceBacklog.clear();
+
+    bool speechOk = finishSpeechPipeline(true);
+
+    return llmOk && speechOk;
+}
+
+// ---------- Konusma akisi ----------
+static bool systemReady = false;
+
+static bool ensureWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return true;
+
+  Serial.println("Wi-Fi koptu, yeniden baglaniliyor...");
+  WiFi.disconnect();
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  unsigned long t = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t < 10000) {
+    delay(250);
+  }
+
+  return WiFi.status() == WL_CONNECTED;
+}
+
+// Uzun basmayla baslar; takip penceresinde konusuldukca tur tur surer.
+static void runConversation() {
+  if (!ensureWiFi()) {
+    Serial.println("HATA: Wi-Fi baglantisi yok.");
+    return;
+  }
+
+  bool followUp = false;
+
+  while (true) {
+    eyeState = EYE_LISTENING;
+
+    if (!followUp) {
+      // Parmak cekilene kadar bekle (birakma sesi kaydi bozmasin).
+      uint32_t t = millis();
+      while (digitalRead(TOUCH_PIN) == HIGH && millis() - t < 3000) {
+        delay(10);
+      }
+      delay(150);
+    }
+
+    if (!setupMicrophone()) {
+      Serial.println("HATA: Mikrofon baslatilamadi.");
+      break;
+    }
+
+    VadResult vad = recordUtterance(
+        followUp ? VAD_FOLLOWUP_WAIT_MS : VAD_FIRST_WAIT_MS);
+    shutdownMicrophone();
+
+    if (vad == VAD_NO_SPEECH) {
+      Serial.println(followUp ? "[VAD] Takip suresi doldu; bosta."
+                              : "[VAD] Konusma algilanmadi.");
+      break;
+    }
+
+    if (vad == VAD_ERROR) {
+      Serial.println("HATA: Ses kaydi basarisiz.");
+      break;
+    }
+
+    eyeState = EYE_THINKING;
+    tStart = millis();   // Sureler konusma bittigi andan olculur.
+
+    String transcript = transcribeAudio();
+    MARK("STT bitti");
+
+    if (transcript.isEmpty()) {
+      Serial.println("Akis STT asamasinda durdu.");
+      break;
+    }
+
+    bool ok = respondToTranscript(transcript);
+    MARK("toplam");
+
+    if (speechAbort) {
+      Serial.println("[AKIS] Soz kesildi; dinlemeye geciliyor.");
+    } else if (!ok) {
+      Serial.println("Yanit/TTS asamasi basarisiz.");
+      break;
+    }
+
+    followUp = true;
+    delay(400);   // Hoparlor yankisi mikrofona karismasin.
+  }
+
+  eyeState = EYE_IDLE;
 }
 
 // ---------- Program akisi ----------
@@ -1303,7 +1821,9 @@ void setup() {
     return;
   }
 
-  Serial.println("\n=== MasaDas Ses -> Metin Akisi ===");
+  startEyeTask();
+
+  Serial.println("\n=== MasaDas ===");
 
   setupServo();
   setupTouch();
@@ -1338,154 +1858,25 @@ void setup() {
     return;
   }
 
+  WiFi.setSleep(false);   // Paket gecikmesi dalgalanmasini azaltir.
   Serial.println("Wi-Fi baglandi.");
 
-  if (!setupMicrophone()) {
-    Serial.println("HATA: Mikrofon baslatilamadi.");
-    return;
-  }
-
-  bool recorded = recordWav();
-
-  if (rxHandle != nullptr) {
-    i2s_channel_disable(rxHandle);
-    i2s_del_channel(rxHandle);
-    rxHandle = nullptr;
-  }
-
-  if (!recorded) {
-    Serial.println("HATA: Ses kaydi basarisiz.");
-    return;
-  }
-
-  File wavFile = LittleFS.open("/recording.wav", "r");
-  if (!wavFile) {
-    Serial.println("HATA: Kayit dosyasi bulunamadi.");
-    return;
-  }
-
-  Serial.printf(
-      "Kayit dosyasi boyutu: %u bayt\n",
-      static_cast<unsigned int>(wavFile.size())
-  );
-  wavFile.close();
-
-  Serial.println("\nSTT islemi baslatiliyor...");
-
-  String transcript = transcribeAudio();
-
-  if (transcript.isEmpty()) {
-    Serial.println("Akis STT asamasinda durdu.");
-    return;
-  }
-
-  Serial.println("\nLLM yaniti uretiliyor...");
-
-  String reply = generateReply(transcript);
-
-  if (reply.isEmpty()) {
-    Serial.println("LLM asamasi basarisiz.");
-    return;
-  }
-
-  Serial.println("\n========== MASADAS YANITI ==========");
-  Serial.println(reply);
-  Serial.println("====================================");
-
-  Serial.println("\nMasaDas yaniti seslendiriliyor...");
-
-  bool spoken = speakText(reply);
-
-  if (!spoken) {
-    Serial.println("TTS asamasi basarisiz.");
-    return;
-  }
-
-  Serial.println("\nSes -> metin -> LLM -> TTS akisi basarili.");
+  systemReady = true;
+  Serial.println("\nHazir. Konusmak icin touch sensorune uzun bas.");
 }
 
-
 void loop() {
-    roboEyes.update();
+  if (!systemReady) {
+    delay(100);
+    return;
+  }
 
-    // Dokunma hareketi ayarlari
-    constexpr unsigned long DEBOUNCE_MS = 40;
-    constexpr unsigned long SHORT_PRESS_MAX_MS = 500;
-    constexpr unsigned long SECOND_PRESS_TIMEOUT_MS = 1200;
-    constexpr unsigned long LONG_PRESS_MS = 1500;
+  bool pressed = false, longPress = false;
+  pollTouch(pressed, longPress);
 
-    enum TouchState {
-        WAIT_FIRST_PRESS,
-        WAIT_SECOND_PRESS,
-        WAIT_LONG_PRESS,
-        WAIT_RELEASE
-    };
+  if (longPress) {
+    runConversation();
+  }
 
-    static TouchState state = WAIT_FIRST_PRESS;
-
-    static int lastRawState = LOW;
-    static int stableState = LOW;
-
-    static unsigned long lastChangeTime = 0;
-    static unsigned long firstPressTime = 0;
-    static unsigned long secondPressTime = 0;
-    static unsigned long firstReleaseTime = 0;
-
-    unsigned long now = millis();
-    int rawState = digitalRead(TOUCH_PIN);
-
-    // Sinyal kararliligi
-    if (rawState != lastRawState) {
-        lastRawState = rawState;
-        lastChangeTime = now;
-    }
-
-    if (now - lastChangeTime < DEBOUNCE_MS) {
-        return;
-    }
-
-    if (stableState != rawState) {
-        stableState = rawState;
-
-        if (stableState == HIGH) {
-            if (state == WAIT_FIRST_PRESS) {
-                firstPressTime = now;
-            } else if (state == WAIT_SECOND_PRESS) {
-                secondPressTime = now;
-                state = WAIT_LONG_PRESS;
-                Serial.println("Ikinci dokunma algilandi; basili tut.");
-            }
-        } else {
-            if (state == WAIT_FIRST_PRESS) {
-                unsigned long duration = now - firstPressTime;
-
-                if (duration <= SHORT_PRESS_MAX_MS) {
-                    firstReleaseTime = now;
-                    state = WAIT_SECOND_PRESS;
-                    Serial.println("Ilk kisa dokunma tamamlandi.");
-                    Serial.println("1.2 saniye icinde tekrar dokun ve basili tut.");
-                }
-            } else if (state == WAIT_LONG_PRESS) {
-                state = WAIT_FIRST_PRESS;
-                Serial.println("Uzun basma tamamlanmadan birakildi; iptal.");
-            } else if (state == WAIT_RELEASE) {
-                state = WAIT_FIRST_PRESS;
-            }
-        }
-    }
-
-    // Ilk dokunmadan sonra ikinci dokunma icin zaman asimi
-    if (state == WAIT_SECOND_PRESS &&
-        now - firstReleaseTime > SECOND_PRESS_TIMEOUT_MS) {
-        state = WAIT_FIRST_PRESS;
-        Serial.println("Dokunma zaman asimi; yeniden bekleniyor.");
-    }
-
-    // Ikinci dokunma 1.5 saniye basili tutulursa tetikle
-    if (state == WAIT_LONG_PRESS &&
-        stableState == HIGH &&
-        now - secondPressTime >= LONG_PRESS_MS) {
-        Serial.println("BAS-KONUS TETIKLENDI");
-        state = WAIT_RELEASE;
-    }
+  delay(10);
 }
