@@ -235,7 +235,6 @@ void setupTouch() {
 // 3x3 bakis konumlari ve her birine karsilik gelen bas donusu (-1..1, sag = +).
 static const uint8_t GAZE_POS[9]  = { DEFAULT, N, NE, E, SE, S, SW, W, NW };
 static const float   GAZE_HEAD[9] = { 0.0f, 0.0f, 0.6f, 1.0f, 0.6f, 0.0f, -0.6f, -1.0f, -0.6f };
-static const int     THINK_GAZE[3] = { 1, 2, 8 };    // N, NE, NW
 
 static constexpr uint32_t ROAM_MIN_MS = 3000;
 static constexpr uint32_t ROAM_MAX_MS = 10000;
@@ -250,10 +249,21 @@ static constexpr uint32_t FAREWELL_MS = 1500;
 static constexpr uint32_t WAKE_MS = 1400;
 static constexpr int EYE_BASE_HEIGHT = 36;            // kutuphane varsayilani (goz boyunuz farkliysa ayarlayin)
 
+// ---- Dusunme (yukleme) animasyonu ----
+static constexpr int EYE_BASE_WIDTH = 36;              // kutuphane varsayilani; goz boyutunu degistirdiyseniz guncelleyin
+static constexpr int EYE_GAP = 10;                     // iki goz arasi
+static constexpr int EYE_RADIUS = 8;                   // goz kose yuvarlagi
+static constexpr int LOADER_DIAMETER = 20;             // daire capi (eskiden 14)
+static constexpr int LOADER_CENTER_DISTANCE = 34;      // iki dairenin merkezleri arasi (eskiden 46)
+static constexpr float LOADER_AMPLITUDE = 12.0f;       // yukari-asagi hareket (piksel)
+static constexpr uint32_t LOADER_PERIOD_MS = 1100;     // bir tam yukari-asagi dongu
+static constexpr uint32_t LOADER_MORPH_MS = 320;       // goz <-> daire gecisi
+
 enum BMode : uint8_t {
   B_ROAM, B_DROWSY, B_SLEEP, B_WAKING,
   B_LISTEN, B_THINK, B_SPEAK,
-  B_LOVE, B_ANGRY, B_FAREWELL
+  B_LOVE, B_ANGRY, B_FAREWELL,
+  B_UNTHINK                      // yukleme animasyonundan gozlere donus
 };
 
 enum : uint8_t { EVT_NONE, EVT_BLINK2, EVT_LOOK_BACK, EVT_YAWN_OPEN, EVT_YAWN_END };
@@ -261,7 +271,6 @@ enum : uint8_t { EVT_NONE, EVT_BLINK2, EVT_LOOK_BACK, EVT_YAWN_OPEN, EVT_YAWN_EN
 static BMode bMode = B_ROAM;
 static uint32_t bModeSince = 0;
 static uint32_t nextRoamAt = 0;
-static uint32_t nextThinkShiftAt = 0;
 static uint32_t shakeStartAt = 0;
 static uint32_t ignoreTapUntil = 0;
 static uint32_t seenPress = 0, seenTap = 0;
@@ -349,9 +358,11 @@ static void enterMode(BMode m) {
 
     case B_THINK:
       roboEyes.setMood(DEFAULT);
-      eyesLook(1, false);                 // yukari bak
+      eyesLook(0, false);                 // animasyon bitince gozler ortada donsun
       headMoveTo(SERVO_CENTER);
-      nextThinkShiftAt = now + random(1800, 3200);
+      break;
+
+    case B_UNTHINK:
       break;
 
     case B_SPEAK:
@@ -480,6 +491,16 @@ static void angryStep(uint32_t now) {
   headWriteAngle(ang);
 }
 
+// Yukleme animasyonundan cikinca guncel konusma fazina gore mod secilir.
+static BMode modeAfterLoader() {
+  switch (appPhase) {
+    case PHASE_LISTENING: return B_LISTEN;
+    case PHASE_THINKING:  return B_THINK;
+    case PHASE_SPEAKING:  return B_SPEAK;
+    default:              return B_ROAM;
+  }
+}
+
 static void updateModeTimers(uint32_t now) {
   uint32_t inMode = now - bModeSince;
 
@@ -493,13 +514,8 @@ static void updateModeTimers(uint32_t now) {
       if (now - lastInteractionMs >= SLEEP_AFTER_MS) enterMode(B_SLEEP);
       break;
 
-    case B_THINK:
-      if (now >= nextThinkShiftAt) {
-        int idx;
-        do { idx = THINK_GAZE[random(0, 3)]; } while (idx == gazeIndex);
-        eyesLook(idx, false);
-        nextThinkShiftAt = now + random(1800, 3200);
-      }
+    case B_UNTHINK:
+      if (inMode >= LOADER_MORPH_MS) enterMode(modeAfterLoader());
       break;
 
     case B_LOVE:     if (inMode >= LOVE_MS)     enterMode(B_ROAM); break;
@@ -514,6 +530,42 @@ static void updateModeTimers(uint32_t now) {
     default:
       break;
   }
+}
+static void drawLoader(uint32_t now) {
+  static uint32_t lastDraw = 0;
+  if (now - lastDraw < 25) return;                       // ~40 kare/sn
+  lastDraw = now;
+
+  float p = static_cast<float>(now - bModeSince) / LOADER_MORPH_MS;
+  if (p > 1.0f) p = 1.0f;
+  if (bMode == B_UNTHINK) p = 1.0f - p;                  // geri donus: daireden goze
+
+  float e = easeInOut(p);                                // 0 = goz, 1 = daire
+
+  float size = EYE_BASE_WIDTH + (LOADER_DIAMETER - EYE_BASE_WIDTH) * e;
+  float radius = EYE_RADIUS + (LOADER_DIAMETER / 2.0f - EYE_RADIUS) * e;
+  float off = LOADER_AMPLITUDE * e *
+              sinf(2.0f * PI * (now % LOADER_PERIOD_MS) / LOADER_PERIOD_MS);
+
+  const int totalW = 2 * EYE_BASE_WIDTH + EYE_GAP;
+  const float eyeCxL = (OLED_WIDTH - totalW) / 2.0f + EYE_BASE_WIDTH / 2.0f;
+  const float eyeCxR = eyeCxL + EYE_BASE_WIDTH + EYE_GAP;
+
+  const float mid = OLED_WIDTH / 2.0f;
+  const float loaderCxL = mid - LOADER_CENTER_DISTANCE / 2.0f;
+  const float loaderCxR = mid + LOADER_CENTER_DISTANCE / 2.0f;
+
+  // Goz merkezinden daire merkezine yumusak kayis: gozler gecis sirasinda iceri dogru toplanir.
+  const float cxL = eyeCxL + (loaderCxL - eyeCxL) * e;
+  const float cxR = eyeCxR + (loaderCxR - eyeCxR) * e;
+  const float cy = OLED_HEIGHT / 2.0f;
+
+  display.clearDisplay();
+  display.fillRoundRect(lroundf(cxL - size / 2), lroundf(cy + off - size / 2),
+                        lroundf(size), lroundf(size), lroundf(radius), SH110X_WHITE);
+  display.fillRoundRect(lroundf(cxR - size / 2), lroundf(cy - off - size / 2),
+                        lroundf(size), lroundf(size), lroundf(radius), SH110X_WHITE);
+  display.display();
 }
 
 static void behaviorStep() {
@@ -532,15 +584,26 @@ static void behaviorStep() {
     BMode want = (phase == PHASE_LISTENING) ? B_LISTEN
                : (phase == PHASE_THINKING)  ? B_THINK
                                             : B_SPEAK;
-    if (bMode != want) enterMode(want);
+
+    if (bMode == B_UNTHINK) {
+      // Yukleme animasyonundan cikis suruyor; bitince guncel faza gore mod secilir.
+    } else if (bMode == B_THINK && want != B_THINK) {
+      enterMode(B_UNTHINK);
+    } else if (bMode != want) {
+      enterMode(want);
+    }
   } else {
-    if (phase == PHASE_FAREWELL && lastPhase != PHASE_FAREWELL) {
+    if (bMode == B_THINK) {
+      enterMode(B_UNTHINK);              // konusma bitti/iptal: once yumusakca goze don
+    } else if (bMode == B_UNTHINK) {
+      // cikis suruyor
+    } else if (phase == PHASE_FAREWELL && lastPhase != PHASE_FAREWELL) {
       enterMode(B_FAREWELL);
-    } else if (bMode == B_LISTEN || bMode == B_THINK || bMode == B_SPEAK) {
+    } else if (bMode == B_LISTEN || bMode == B_SPEAK) {
       enterMode(B_ROAM);
     }
 
-    handleTouchIdle(now);
+    if (bMode != B_UNTHINK) handleTouchIdle(now);
   }
 
   lastPhase = phase;
@@ -560,7 +623,12 @@ static void behaviorStep() {
   }
 
   headUpdate();
-  roboEyes.update();
+
+  if (bMode == B_THINK || bMode == B_UNTHINK) {
+    drawLoader(now);                     // gozler iki daire: biri yukari, biri asagi
+  } else {
+    roboEyes.update();
+  }
 }
 
 static void behaviorTask(void *parameter) {
@@ -697,12 +765,14 @@ static constexpr size_t VAD_PREROLL_BLOCKS = 8;          // ~128 ms geri tampon
 static constexpr size_t VAD_CAL_BLOCKS = 10;             // ~160 ms gurultu olcumu
 static constexpr size_t VAD_START_BLOCKS = 2;            // ust uste 2 blok esigi asarsa konusma
 static constexpr size_t VAD_TAIL_KEEP_BLOCKS = 8;        // sondaki sessizlikten ~128 ms birak
-static constexpr size_t VAD_MIN_SPEECH_BLOCKS = 10;      // ~160 ms'den kisa sesler gurultu sayilir
+static constexpr size_t VAD_MIN_SPEECH_BLOCKS = 16;      // ~160 ms'den kisa sesler gurultu sayilir
+static constexpr size_t VAD_SETTLE_BLOCKS = 14;          // mikrofon acilis gecicisini atla (~220 ms)
 
 enum VadResult { VAD_OK, VAD_NO_SPEECH, VAD_ERROR };
 
 // Kayittan sonra STT'ye gonderilecek gercek WAV boyutu (dosya daha buyuk kalabilir).
 static size_t recordedWavBytes = 0;
+static bool sttWasEmpty = false;
 
 static int16_t vadRing[VAD_PREROLL_BLOCKS][BUFFER_SAMPLES];
 static uint16_t vadRingLen[VAD_PREROLL_BLOCKS];
@@ -771,6 +841,7 @@ static VadResult recordUtterance(uint32_t waitForSpeechMs) {
   uint32_t samplesWritten = 0;
   bool speaking = false;
   size_t calBlocks = 0, aboveRun = 0, silenceBlocks = 0, speechBlocks = 0;
+  size_t settleBlocks = 0;
   uint32_t calSum = 0;
   int noise = 0;
   int startThr = VAD_MIN_THRESHOLD;
@@ -795,6 +866,11 @@ static VadResult recordUtterance(uint32_t waitForSpeechMs) {
       Serial.printf("I2S okuma hatasi: %d\n", err);
       file.close();
       return VAD_ERROR;
+    }
+
+    if (settleBlocks < VAD_SETTLE_BLOCKS) {
+      settleBlocks++;
+      continue;   // acilis gecicisini atla
     }
 
     size_t count = bytesRead / sizeof(int32_t);
@@ -953,6 +1029,34 @@ private:
     int peekValue = -1;
     bool readError = false;
 
+    uint8_t blockBuf[768];          // 3'un kati: dosya 768'lik bloklarla okunur
+    size_t blockPos = 0;
+    size_t blockLen = 0;
+    size_t fetched = 0;             // dosyadan okunan toplam bayt
+
+    // `want` bayti RAM tamponundan verir; tampon bosalinca dosyadan toplu okur.
+    size_t takeRaw(uint8_t *out, size_t want) {
+        size_t got = 0;
+
+        while (got < want) {
+            if (blockPos >= blockLen) {
+                size_t left = fileSize - fetched;
+                if (left == 0) break;
+
+                size_t n = left < sizeof(blockBuf) ? left : sizeof(blockBuf);
+                blockLen = file.read(blockBuf, n);
+                blockPos = 0;
+
+                if (blockLen == 0) break;
+                fetched += blockLen;
+            }
+
+            out[got++] = blockBuf[blockPos++];
+        }
+
+        return got;
+    }
+
     int nextByte() {
         if (prefixPos < strlen(prefix)) {
             return prefix[prefixPos++];
@@ -965,7 +1069,7 @@ private:
                 size_t remaining = fileSize - rawRead;
                 size_t expected = remaining >= 3 ? 3 : remaining;
 
-                size_t count = file.read(input, expected);
+                size_t count = takeRaw(input, expected);
 
                 if (count != expected) {
                     readError = true;
@@ -1081,6 +1185,7 @@ public:
 // ---------- Openrouter STT ----------
 String transcribeAudio() {
     Serial.println("\nOpenRouter Deepgram Nova-3 STT baslatiliyor...");
+    sttWasEmpty = false;
 
     File wav = LittleFS.open("/recording.wav", "r");
 
@@ -1154,6 +1259,8 @@ String transcribeAudio() {
     );
 
     Serial.println("Nova-3 istegi gonderiliyor...");
+  
+    MARK("STT istek basliyor");
 
     int status = http.sendRequest(
         "POST",
@@ -1162,6 +1269,8 @@ String transcribeAudio() {
     );
 
     String responseBody = http.getString();
+
+    MARK("STT yanit geldi");
 
     Serial.printf("STT HTTP durumu: %d\n", status);
 
@@ -1202,11 +1311,11 @@ String transcribeAudio() {
 
     String transcript = result["text"] | "";
 
+    transcript.trim();
+
     if (transcript.isEmpty()) {
-        Serial.println(
-            "HATA: STT yanitinda metin bulunamadi."
-        );
-        Serial.println(responseBody);
+        Serial.println("[STT] Metin bos (anlasilir konusma yok).");
+        sttWasEmpty = true;
         return "";
     }
 
@@ -1227,7 +1336,7 @@ static constexpr gpio_num_t TTS_WS   = GPIO_NUM_15;
 static constexpr gpio_num_t TTS_DOUT = GPIO_NUM_23;
 
 static constexpr uint32_t TTS_SAMPLE_RATE = 24000;
-static constexpr float TTS_VOLUME = 0.3f;   // 0.0 - 1.0
+static constexpr float TTS_VOLUME = 0.7f;   // 0.0 - 1.0
 
 // playPcmChunk icin: 1536 ornek (3072 bayt) -> stereo 32 bit.
 static int32_t ttsI2sBuffer[3072];
@@ -1307,6 +1416,21 @@ void shutdownSpeaker() {
   txHandle = nullptr;
 }
 
+// Tepeleri sert kirpmak yerine yumusakca sikistirir: kirpilma cizirtisi yerine hafif sikisma.
+static inline int16_t softLimit(float x) {
+  constexpr float KNEE = 22000.0f;
+  constexpr float HEADROOM = 32700.0f - KNEE;
+
+  float a = x < 0.0f ? -x : x;
+
+  if (a > KNEE) {
+    float u = (a - KNEE) / HEADROOM;
+    a = KNEE + HEADROOM * (u / (1.0f + u));
+  }
+
+  return static_cast<int16_t>(x < 0.0f ? -a : a);
+}
+
 // Mono 16-bit PCM sesini stereo 32-bit I2S formatina aktar.
 bool playPcmChunk(const uint8_t *pcm, size_t pcmLength) {
   size_t sampleCount = pcmLength / 2;
@@ -1329,7 +1453,7 @@ bool playPcmChunk(const uint8_t *pcm, size_t pcmLength) {
     if (a > peak) peak = a;
 
     // 16-bit ornegi 32-bit slotun ust bitlerine yerlestir.
-    int32_t scaled = static_cast<int32_t>(sample * TTS_VOLUME) * 65536L;
+    int32_t scaled = static_cast<int32_t>(softLimit(sample * TTS_VOLUME)) * 65536L;
 
     ttsI2sBuffer[i * 2] = scaled;       // Sol kanal
     ttsI2sBuffer[i * 2 + 1] = scaled;   // Sag kanal
@@ -1718,6 +1842,8 @@ static int ttsSynthesizeSentence(HTTPClient &http,
 
     int status = http.POST(body);
 
+    MARK("TTS yanit basliklari");
+
     if (status < 0) {
         Serial.printf("[TTS] Baglanti hatasi: %s\n",
                       http.errorToString(status).c_str());
@@ -1999,6 +2125,7 @@ static bool finishSpeechPipeline(bool workerStarted) {
     request["max_tokens"] = 400;
     request["reasoning"]["enabled"] = false;
     request["temperature"] = 0.7;
+    request["provider"]["sort"] = "latency";
 
     String requestBody;
     serializeJson(request, requestBody);
@@ -2007,6 +2134,8 @@ static bool finishSpeechPipeline(bool workerStarted) {
 
     int status = http.POST(requestBody);
     Serial.printf("LLM HTTP durumu: %d\n", status);
+
+    MARK("LLM baglandi");
 
     if (status < 200 || status >= 300) {
         Serial.println("OpenRouter LLM API hatasi:");
@@ -2021,6 +2150,7 @@ static bool finishSpeechPipeline(bool workerStarted) {
     String pending;
     bool streamFinished = false;
     bool llmFailed = false;
+    bool gotFirstToken = false;
     unsigned long lastDataTime = millis();
 
     while (!streamFinished) {
@@ -2069,6 +2199,10 @@ static bool finishSpeechPipeline(bool workerStarted) {
                                 | "";
 
                         if (content[0] != '\0') {
+                            if (!gotFirstToken) {
+                                gotFirstToken = true;
+                                MARK("LLM ilk parca");
+                            }
                             reply += content;
                             pending += content;
                             flushSentences(pending, false);
@@ -2212,6 +2346,7 @@ static void runConversation() {
 
   bool followUp = false;
   bool endedBySilence = false;
+  int emptyCount = 0;
 
   while (true) {
     appPhase = PHASE_LISTENING;
@@ -2256,9 +2391,17 @@ static void runConversation() {
     MARK("STT bitti");
 
     if (transcript.isEmpty()) {
+      if (sttWasEmpty && ++emptyCount <= 2) {
+        Serial.println("[AKIS] Anlasilir konusma yok; dinlemeye devam.");
+        followUp = true;
+        continue;
+      }
+
       Serial.println("Akis STT asamasinda durdu.");
       break;
     }
+
+    emptyCount = 0;
 
     bool ok = respondToTranscript(transcript);
     MARK("toplam");
