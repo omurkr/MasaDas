@@ -41,6 +41,22 @@ Adafruit_SH1106G display(
 
 RoboEyes<Adafruit_SH1106G> roboEyes(display);
 
+// ---------- Davranis ortak durumu ----------
+enum AppPhase : uint8_t {
+  PHASE_IDLE,       // konusma yok
+  PHASE_LISTENING,  // dinliyor (takip penceresi dahil)
+  PHASE_THINKING,   // STT + LLM + TTS hazirligi
+  PHASE_SPEAKING,   // ses caliyor
+  PHASE_FAREWELL    // konusma sessizlikle bitti
+};
+
+enum SoundId : uint8_t { SND_NONE, SND_LISTEN, SND_HAPPY, SND_ANGRY, SND_YAWN };
+
+static volatile AppPhase appPhase = PHASE_IDLE;
+static volatile uint8_t ttsLevel = 0;               // 0..255, calan sesin siddeti
+static volatile SoundId pendingSound = SND_NONE;    // loop() calar
+static volatile uint32_t lastInteractionMs = 0;
+
 bool setupOLED() {
   Wire.begin(OLED_SDA, OLED_SCL);
   Wire.setClock(400000);
@@ -65,85 +81,26 @@ bool setupOLED() {
   return true;
 }
 
-// ---------- Goz durumlari ----------
-enum EyeState : uint8_t {
-  EYE_IDLE,        // bosta
-  EYE_LISTENING,   // dinliyor
-  EYE_THINKING,    // dusunuyor
-  EYE_SPEAKING     // konusuyor
-};
-
-static volatile EyeState eyeState = EYE_IDLE;
-
-// Yalnizca goz gorevi cagirir (RoboEyes nesnesine tek gorev dokunur).
-static void applyEyeState(EyeState s) {
-  switch (s) {
-    case EYE_IDLE:
-      roboEyes.setMood(DEFAULT);
-      roboEyes.setPosition(DEFAULT);
-      roboEyes.setCuriosity(OFF);
-      roboEyes.setIdleMode(ON, 5, 10);
-      roboEyes.setAutoblinker(ON, 3, 2);
-      roboEyes.open();
-      break;
-
-    case EYE_LISTENING:
-      roboEyes.setMood(DEFAULT);
-      roboEyes.setPosition(DEFAULT);
-      roboEyes.setIdleMode(OFF, 5, 10);
-      roboEyes.setCuriosity(ON);
-      roboEyes.open();
-      break;
-
-    case EYE_THINKING:
-      roboEyes.setMood(TIRED);
-      roboEyes.setPosition(NE);
-      roboEyes.setIdleMode(OFF, 5, 10);
-      roboEyes.setCuriosity(OFF);
-      break;
-
-    case EYE_SPEAKING:
-      roboEyes.setMood(HAPPY);
-      roboEyes.setPosition(DEFAULT);
-      roboEyes.setCuriosity(OFF);
-      roboEyes.setIdleMode(ON, 3, 6);
-      break;
-  }
-}
-
-static void eyeTask(void *parameter) {
-  (void)parameter;
-
-  EyeState applied = EYE_IDLE;
-
-  for (;;) {
-    EyeState wanted = eyeState;
-
-    if (wanted != applied) {
-      applied = wanted;
-      applyEyeState(wanted);
-    }
-
-    roboEyes.update();
-    vTaskDelay(pdMS_TO_TICKS(10));
-  }
-}
-
-static void startEyeTask() {
-  xTaskCreate(eyeTask, "Eyes", 5120, nullptr, 1, nullptr);
-}
-
 // ---------- Servo ----------
 Servo headServo;
 
 constexpr int SERVO_PIN = 19;
 constexpr int SERVO_CENTER = 90;
 
+static constexpr float HEAD_TURN_DEG = 25.0f;        // sag/sol bakista bas donusu
+static constexpr int   HEAD_DIRECTION = 1;           // yon ters ise -1 yapin
+static constexpr bool  SERVO_DETACH_WHEN_IDLE = false;
+
+static float headAngle = SERVO_CENTER;               // anlik aci
+static float headFrom = SERVO_CENTER, headTo = SERVO_CENTER;
+static uint32_t headMoveStart = 0, headMoveDur = 1;
+static bool headMoving = false;
+static uint32_t headLastMotion = 0;
+
 void setupServo() {
     headServo.setPeriodHertz(50);
 
     int servoChannel = headServo.attach(SERVO_PIN, 1000, 2000);
-
     Serial.printf("Servo attach sonucu: %d\n", servoChannel);
 
     if (!headServo.attached()) {
@@ -151,56 +108,477 @@ void setupServo() {
         return;
     }
 
-    Serial.println("Servo PWM kanali basariyla baslatildi.");
-
     headServo.write(SERVO_CENTER);
+    headAngle = SERVO_CENTER;
     Serial.println("Servo orta konuma getirildi.");
+}
+
+static void headWriteAngle(float deg) {
+    deg = constrain(deg, 0.0f, 180.0f);
+    headAngle = deg;
+
+    if (!headServo.attached()) {
+        headServo.attach(SERVO_PIN, 1000, 2000);
+    }
+
+    headServo.writeMicroseconds(1000 + static_cast<int>(deg * (1000.0f / 180.0f)));
+}
+
+static float easeInOut(float t) {
+    return 0.5f - 0.5f * cosf(PI * t);   // yavas - hizli - yavas
+}
+
+// Baslangic her zaman anlik aci: ani sicrama olmaz, hareket ortasinda da yeniden planlanir.
+static void headMoveTo(float target, uint32_t durationMs = 0) {
+    target = constrain(target, 20.0f, 160.0f);
+
+    if (durationMs == 0) {
+        float d = 250.0f + fabsf(target - headAngle) * 18.0f;
+        if (d < 350.0f) d = 350.0f;
+        if (d > 1300.0f) d = 1300.0f;
+        durationMs = static_cast<uint32_t>(d);
+    }
+
+    headFrom = headAngle;
+    headTo = target;
+    headMoveStart = millis();
+    headMoveDur = durationMs;
+    headMoving = true;
+}
+
+static void headUpdate() {
+    uint32_t now = millis();
+
+    if (headMoving) {
+        float t = static_cast<float>(now - headMoveStart) / static_cast<float>(headMoveDur);
+
+        if (t >= 1.0f) {
+            t = 1.0f;
+            headMoving = false;
+            headLastMotion = now;
+        }
+
+        headWriteAngle(headFrom + (headTo - headFrom) * easeInOut(t));
+    } else if (SERVO_DETACH_WHEN_IDLE && headServo.attached() &&
+               now - headLastMotion > 1000) {
+        headServo.detach();
+    }
 }
 
 // ---------- Touch ----------
 constexpr int TOUCH_PIN = 4;
-void setupTouch() {
-    pinMode(TOUCH_PIN, INPUT);
-    Serial.println("Touch sensor hazir.");
-}
 
 static constexpr unsigned long TOUCH_DEBOUNCE_MS = 40;
 static constexpr unsigned long TOUCH_LONG_PRESS_MS = 800;
 
-// Sik sik cagirin. pressed: yeni basildi, longPress: uzun basma tamamlandi (basista bir kez).
-static void pollTouch(bool &pressed, bool &longPress) {
-  static int lastRaw = LOW;
-  static int stable = LOW;
-  static unsigned long lastChange = 0;
-  static unsigned long pressStart = 0;
-  static bool longFired = false;
+// Olaylar sayac olarak tutulur; her tuketici kendi "son gordugum" degerini saklar.
+static volatile uint32_t touchPressSeq = 0;   // her basista artar
+static volatile uint32_t touchTapSeq = 0;     // kisa dokunus birakilinca artar
+static volatile uint32_t touchLongSeq = 0;    // uzun basma tamamlaninca artar
 
-  pressed = false;
-  longPress = false;
+static bool takeEvent(volatile uint32_t &seq, uint32_t &seen) {
+    uint32_t v = seq;
+    if (v == seen) return false;
+    seen = v;
+    return true;
+}
 
-  unsigned long now = millis();
-  int raw = digitalRead(TOUCH_PIN);
+static void touchTask(void *parameter) {
+    (void)parameter;
 
-  if (raw != lastRaw) {
-    lastRaw = raw;
-    lastChange = now;
-  }
+    int lastRaw = LOW, stable = LOW;
+    unsigned long lastChange = 0, pressStart = 0;
+    bool longFired = false;
 
-  if (now - lastChange >= TOUCH_DEBOUNCE_MS && raw != stable) {
-    stable = raw;
+    for (;;) {
+        unsigned long now = millis();
+        int raw = digitalRead(TOUCH_PIN);
 
-    if (stable == HIGH) {
-      pressStart = now;
-      longFired = false;
-      pressed = true;
+        if (raw != lastRaw) {
+            lastRaw = raw;
+            lastChange = now;
+        }
+
+        if (now - lastChange >= TOUCH_DEBOUNCE_MS && raw != stable) {
+            stable = raw;
+            lastInteractionMs = now;
+
+            if (stable == HIGH) {
+                pressStart = now;
+                longFired = false;
+                touchPressSeq = touchPressSeq + 1;
+            } else if (!longFired) {
+                touchTapSeq = touchTapSeq + 1;   // uzun basma degilse kisa dokunus
+            }
+        }
+
+        if (stable == HIGH && !longFired &&
+            now - pressStart >= TOUCH_LONG_PRESS_MS) {
+            longFired = true;
+            touchLongSeq = touchLongSeq + 1;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
+}
+
+void setupTouch() {
+    pinMode(TOUCH_PIN, INPUT);
+    xTaskCreate(touchTask, "Touch", 3072, nullptr, 1, nullptr);
+    Serial.println("Touch sensor hazir.");
+}
+
+// =====================================================================
+//  Davranis motoru (gozler + bas servosu)
+// =====================================================================
+
+// 3x3 bakis konumlari ve her birine karsilik gelen bas donusu (-1..1, sag = +).
+static const uint8_t GAZE_POS[9]  = { DEFAULT, N, NE, E, SE, S, SW, W, NW };
+static const float   GAZE_HEAD[9] = { 0.0f, 0.0f, 0.6f, 1.0f, 0.6f, 0.0f, -0.6f, -1.0f, -0.6f };
+static const int     THINK_GAZE[3] = { 1, 2, 8 };    // N, NE, NW
+
+static constexpr uint32_t ROAM_MIN_MS = 3000;
+static constexpr uint32_t ROAM_MAX_MS = 10000;
+static constexpr uint32_t DROWSY_AFTER_MS = 90000;    // test icin 10000 yapin
+static constexpr uint32_t SLEEP_AFTER_MS = 180000;    // test icin 20000 yapin
+static constexpr uint32_t ANGRY_TAP_COUNT = 4;
+static constexpr uint32_t ANGRY_TAP_WINDOW_MS = 4000;
+static constexpr uint32_t LOVE_MS = 1600;
+static constexpr uint32_t ANGRY_MS = 3500;
+static constexpr uint32_t SHAKE_MS = 1300;            // 5 Hz x 1.3 sn = 6.5 salinim (merkezde biter)
+static constexpr uint32_t FAREWELL_MS = 1500;
+static constexpr uint32_t WAKE_MS = 1400;
+static constexpr int EYE_BASE_HEIGHT = 36;            // kutuphane varsayilani (goz boyunuz farkliysa ayarlayin)
+
+enum BMode : uint8_t {
+  B_ROAM, B_DROWSY, B_SLEEP, B_WAKING,
+  B_LISTEN, B_THINK, B_SPEAK,
+  B_LOVE, B_ANGRY, B_FAREWELL
+};
+
+enum : uint8_t { EVT_NONE, EVT_BLINK2, EVT_LOOK_BACK, EVT_YAWN_OPEN, EVT_YAWN_END };
+
+static BMode bMode = B_ROAM;
+static uint32_t bModeSince = 0;
+static uint32_t nextRoamAt = 0;
+static uint32_t nextThinkShiftAt = 0;
+static uint32_t shakeStartAt = 0;
+static uint32_t ignoreTapUntil = 0;
+static uint32_t seenPress = 0, seenTap = 0;
+static uint32_t tapTimes[ANGRY_TAP_COUNT] = {0};
+static uint8_t tapIndex = 0;
+static int gazeIndex = 0;
+static AppPhase lastPhase = PHASE_IDLE;
+static uint8_t smoothLevel = 0;
+static int appliedHeight = EYE_BASE_HEIGHT;
+static uint8_t evt = EVT_NONE;
+static uint32_t evtAt = 0;
+static bool headDelayArmed = false;
+static uint32_t headDelayAt = 0;
+static float headDelayTarget = SERVO_CENTER;
+
+
+static void applyEyeHeight(int h) {
+  if (h == appliedHeight) return;
+  appliedHeight = h;
+  roboEyes.setHeight(h, h);
+}
+
+// Gozler once bakar, bas ~200 ms sonra doner.
+static void eyesLook(int idx, bool followWithHead) {
+  gazeIndex = idx;
+  roboEyes.setPosition(GAZE_POS[idx]);
+
+  if (followWithHead) {
+    headDelayTarget = SERVO_CENTER + HEAD_DIRECTION * HEAD_TURN_DEG * GAZE_HEAD[idx];
+    headDelayAt = millis() + 200;
+    headDelayArmed = true;
+  }
+}
+
+static void enterMode(BMode m) {
+  uint32_t now = millis();
+  BMode prev = bMode;
+
+  bMode = m;
+  bModeSince = now;
+  headDelayArmed = false;
+  evt = EVT_NONE;
+
+  roboEyes.setCuriosity(OFF);            // yan bakista goz buyumesin
+  roboEyes.setIdleMode(OFF, 5, 10);      // rastgele bakisi biz yonetiyoruz
+  roboEyes.setAutoblinker(ON, 3, 2);
+  if (m != B_SLEEP) roboEyes.open();
+  if (m != B_SPEAK) applyEyeHeight(EYE_BASE_HEIGHT);
+
+  switch (m) {
+    case B_ROAM:
+      roboEyes.setMood(DEFAULT);
+      eyesLook(0, false);
+      headMoveTo(SERVO_CENTER);
+      nextRoamAt = now + random(ROAM_MIN_MS, ROAM_MAX_MS + 1);
+      break;
+
+    case B_DROWSY:
+      roboEyes.setMood(TIRED);
+      roboEyes.setAutoblinker(ON, 6, 3);
+      eyesLook(5, false);                 // asagi bak
+      headMoveTo(SERVO_CENTER);
+      break;
+
+    case B_SLEEP:
+      roboEyes.setMood(DEFAULT);
+      roboEyes.setAutoblinker(OFF, 3, 2);
+      eyesLook(0, false);
+      roboEyes.close();                   // iki ince cizgi      
+      headMoveTo(SERVO_CENTER);
+      break;
+
+    case B_WAKING:
+      roboEyes.setMood(TIRED);
+      eyesLook(0, false);
+      headMoveTo(SERVO_CENTER);
+      pendingSound = SND_YAWN;
+      break;
+
+    case B_LISTEN:
+      roboEyes.setMood(DEFAULT);
+      eyesLook(0, false);
+      headMoveTo(SERVO_CENTER);
+      break;
+
+    case B_THINK:
+      roboEyes.setMood(DEFAULT);
+      eyesLook(1, false);                 // yukari bak
+      headMoveTo(SERVO_CENTER);
+      nextThinkShiftAt = now + random(1800, 3200);
+      break;
+
+    case B_SPEAK:
+      roboEyes.setMood(DEFAULT);
+      eyesLook(0, false);
+      headMoveTo(SERVO_CENTER);
+      break;
+
+    case B_LOVE:
+      roboEyes.setMood(HAPPY);
+      eyesLook(0, false);
+      headMoveTo(SERVO_CENTER);
+      pendingSound = SND_HAPPY;
+      break;
+
+    case B_ANGRY:
+      roboEyes.setMood(ANGRY);
+      eyesLook(0, false);
+      headMoveTo(SERVO_CENTER, 400);
+      shakeStartAt = now + 450;
+      pendingSound = SND_ANGRY;
+      break;
+
+    case B_FAREWELL:
+      roboEyes.setMood(HAPPY);
+      eyesLook(0, false);
+      headMoveTo(SERVO_CENTER);
+      break;
+  }
+}
+
+// Bosta / uyku dokunma mantigi.
+static void handleTouchIdle(uint32_t now) {
+  bool pressed = (touchPressSeq != seenPress);
+  bool tapped = (touchTapSeq != seenTap);
+  seenPress = touchPressSeq;
+  seenTap = touchTapSeq;
+
+  if (bMode == B_SLEEP || bMode == B_DROWSY) {
+    if (pressed) {
+      ignoreTapUntil = now + 1200;        // uyandiran dokunus "sevilme" sayilmasin
+      enterMode(B_WAKING);
+    }
+    return;
   }
 
-  if (stable == HIGH && !longFired &&
-      now - pressStart >= TOUCH_LONG_PRESS_MS) {
-    longFired = true;
-    longPress = true;
+  if (bMode == B_WAKING || bMode == B_ANGRY) return;
+  if (!tapped || now < ignoreTapUntil) return;
+
+  tapTimes[tapIndex] = now;
+  tapIndex = (tapIndex + 1) % ANGRY_TAP_COUNT;
+
+  uint32_t recent = 0;
+  for (uint32_t t : tapTimes) {
+    if (t != 0 && now - t <= ANGRY_TAP_WINDOW_MS) recent++;
   }
+
+  if (recent >= ANGRY_TAP_COUNT) {
+    memset(tapTimes, 0, sizeof(tapTimes));
+    enterMode(B_ANGRY);
+  } else {
+    enterMode(B_LOVE);
+  }
+}
+
+static void roamStep(uint32_t now) {
+  nextRoamAt = now + random(ROAM_MIN_MS, ROAM_MAX_MS + 1);
+  int r = random(0, 100);
+
+  if (r < 10) {                                   // cift goz kirpma
+    roboEyes.blink();
+    evt = EVT_BLINK2;
+    evtAt = now + 380;
+  } else if (r < 18) {                            // once sola, sonra saga hizli bakis
+    eyesLook(7, true);
+    evt = EVT_LOOK_BACK;
+    evtAt = now + 900;
+  } else if (r < 24 && now - lastInteractionMs > 40000) {   // esneme
+    pendingSound = SND_YAWN;
+    roboEyes.setMood(TIRED);
+    roboEyes.setAutoblinker(OFF, 3, 2);
+    roboEyes.close();
+    evt = EVT_YAWN_OPEN;
+    evtAt = now + 1300;
+    nextRoamAt = now + 5000;
+  } else {                                        // normal: yeni konuma bak
+    int idx;
+    do { idx = random(0, 9); } while (idx == gazeIndex);
+    eyesLook(idx, true);
+  }
+}
+
+static void runPendingEvent(uint32_t now) {
+  if (evt == EVT_NONE || now < evtAt) return;
+
+  uint8_t e = evt;
+  evt = EVT_NONE;
+
+  switch (e) {
+    case EVT_BLINK2:
+      roboEyes.blink();
+      break;
+    case EVT_LOOK_BACK:
+      eyesLook(3, true);
+      break;
+    case EVT_YAWN_OPEN:
+      roboEyes.open();
+      evt = EVT_YAWN_END;
+      evtAt = now + 800;
+      break;
+    case EVT_YAWN_END:
+      roboEyes.setMood(DEFAULT);
+      roboEyes.setAutoblinker(ON, 3, 2);
+      break;
+  }
+}
+
+static void angryStep(uint32_t now) {
+  if (now < shakeStartAt || now >= shakeStartAt + SHAKE_MS) return;
+
+  float elapsed = static_cast<float>(now - shakeStartAt);
+  float env = sinf(PI * elapsed / SHAKE_MS);                       // 0 -> 1 -> 0
+  float ang = SERVO_CENTER + 9.0f * env * sinf(2.0f * PI * 5.0f * elapsed / 1000.0f);
+
+  headMoving = false;
+  headWriteAngle(ang);
+}
+
+static void updateModeTimers(uint32_t now) {
+  uint32_t inMode = now - bModeSince;
+
+  switch (bMode) {
+    case B_ROAM:
+      if (now - lastInteractionMs >= DROWSY_AFTER_MS) { enterMode(B_DROWSY); break; }
+      if (now >= nextRoamAt) roamStep(now);
+      break;
+
+    case B_DROWSY:
+      if (now - lastInteractionMs >= SLEEP_AFTER_MS) enterMode(B_SLEEP);
+      break;
+
+    case B_THINK:
+      if (now >= nextThinkShiftAt) {
+        int idx;
+        do { idx = THINK_GAZE[random(0, 3)]; } while (idx == gazeIndex);
+        eyesLook(idx, false);
+        nextThinkShiftAt = now + random(1800, 3200);
+      }
+      break;
+
+    case B_LOVE:     if (inMode >= LOVE_MS)     enterMode(B_ROAM); break;
+    case B_FAREWELL: if (inMode >= FAREWELL_MS) enterMode(B_ROAM); break;
+    case B_WAKING:   if (inMode >= WAKE_MS)     enterMode(B_ROAM); break;
+
+    case B_ANGRY:
+      angryStep(now);
+      if (inMode >= ANGRY_MS) enterMode(B_ROAM);
+      break;
+
+    default:
+      break;
+  }
+}
+
+static void behaviorStep() {
+  uint32_t now = millis();
+  AppPhase phase = appPhase;
+  bool inConversation = (phase == PHASE_LISTENING ||
+                         phase == PHASE_THINKING ||
+                         phase == PHASE_SPEAKING);
+
+  if (inConversation) {
+    // Konusma sirasinda dokunma, soz kesme mantigina aittir.
+    lastInteractionMs = now;
+    seenPress = touchPressSeq;
+    seenTap = touchTapSeq;
+
+    BMode want = (phase == PHASE_LISTENING) ? B_LISTEN
+               : (phase == PHASE_THINKING)  ? B_THINK
+                                            : B_SPEAK;
+    if (bMode != want) enterMode(want);
+  } else {
+    if (phase == PHASE_FAREWELL && lastPhase != PHASE_FAREWELL) {
+      enterMode(B_FAREWELL);
+    } else if (bMode == B_LISTEN || bMode == B_THINK || bMode == B_SPEAK) {
+      enterMode(B_ROAM);
+    }
+
+    handleTouchIdle(now);
+  }
+
+  lastPhase = phase;
+
+  updateModeTimers(now);
+  runPendingEvent(now);
+
+  if (headDelayArmed && now >= headDelayAt) {
+    headDelayArmed = false;
+    headMoveTo(headDelayTarget);
+  }
+
+  if (bMode == B_SPEAK) {
+    // Sesin siddetine gore goz yuksekligi hafifce nabiz gibi atar.
+    smoothLevel = static_cast<uint8_t>((smoothLevel * 3 + ttsLevel) / 4);
+    applyEyeHeight(EYE_BASE_HEIGHT - 2 + (smoothLevel * 8) / 255);
+  }
+
+  headUpdate();
+  roboEyes.update();
+}
+
+static void behaviorTask(void *parameter) {
+  (void)parameter;
+
+  seenPress = touchPressSeq;
+  seenTap = touchTapSeq;
+  lastInteractionMs = millis();
+  enterMode(B_ROAM);
+
+  for (;;) {
+    behaviorStep();
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+}
+
+static void startBehaviorTask() {
+  xTaskCreate(behaviorTask, "Behavior", 6144, nullptr, 1, nullptr);
 }
 
 // ---------- Mikrofon ----------
@@ -309,7 +687,7 @@ void shutdownMicrophone() {
 // ---------- Konusma algilama (VAD) ----------
 static constexpr uint32_t VAD_BLOCK_MS = BUFFER_SAMPLES * 1000 / SAMPLE_RATE;   // 16 ms
 static constexpr uint32_t VAD_FIRST_WAIT_MS = 6000;      // ilk tur: konusmaya baslama suresi
-static constexpr uint32_t VAD_FOLLOWUP_WAIT_MS = 5000;   // takip penceresi
+static constexpr uint32_t VAD_FOLLOWUP_WAIT_MS = 10000;   // takip penceresi
 static constexpr uint32_t VAD_END_SILENCE_MS = 800;      // bu kadar sessizlik = bitti
 static constexpr uint32_t VAD_MAX_SPEECH_MS = 8000;
 static constexpr int VAD_MIN_THRESHOLD = 150;            // ortalama mutlak genlik
@@ -938,6 +1316,8 @@ bool playPcmChunk(const uint8_t *pcm, size_t pcmLength) {
     return false;
   }
 
+  int32_t peak = 0;
+
   for (size_t i = 0; i < sampleCount; i++) {
     uint16_t raw =
         static_cast<uint16_t>(pcm[i * 2]) |
@@ -945,12 +1325,18 @@ bool playPcmChunk(const uint8_t *pcm, size_t pcmLength) {
 
     int16_t sample = static_cast<int16_t>(raw);
 
+    int32_t a = sample < 0 ? -static_cast<int32_t>(sample) : sample;
+    if (a > peak) peak = a;
+
     // 16-bit ornegi 32-bit slotun ust bitlerine yerlestir.
     int32_t scaled = static_cast<int32_t>(sample * TTS_VOLUME) * 65536L;
 
     ttsI2sBuffer[i * 2] = scaled;       // Sol kanal
     ttsI2sBuffer[i * 2 + 1] = scaled;   // Sag kanal
   }
+
+  int32_t lv = peak / 96;
+  ttsLevel = static_cast<uint8_t>(lv > 255 ? 255 : lv);
 
   size_t totalBytes = sampleCount * 2 * sizeof(int32_t);
   size_t offset = 0;
@@ -975,6 +1361,77 @@ bool playPcmChunk(const uint8_t *pcm, size_t pcmLength) {
   }
 
   return true;
+}
+
+// =====================================================================
+//  Yerel ses efektleri (internet gerekmez)
+// =====================================================================
+
+static void playToneSweep(float f0, float f1, uint32_t ms, int16_t amp) {
+  static int16_t buf[512];
+
+  uint32_t total = TTS_SAMPLE_RATE * ms / 1000;
+  uint32_t edge = TTS_SAMPLE_RATE / 100;          // 10 ms yumusatma
+  float phase = 0.0f;
+  uint32_t done = 0;
+
+  while (done < total) {
+    size_t n = total - done;
+    if (n > 512) n = 512;
+
+    for (size_t i = 0; i < n; i++) {
+      uint32_t k = done + i;
+      float freq = f0 + (f1 - f0) * (static_cast<float>(k) / total);
+
+      phase += 2.0f * PI * freq / TTS_SAMPLE_RATE;
+      if (phase > 2.0f * PI) phase -= 2.0f * PI;
+
+      float env = 1.0f;
+      if (k < edge) env = static_cast<float>(k) / edge;
+      else if (total - k < edge) env = static_cast<float>(total - k) / edge;
+
+      buf[i] = static_cast<int16_t>(sinf(phase) * amp * env);
+    }
+
+    if (!playPcmChunk(reinterpret_cast<const uint8_t *>(buf), n * 2)) return;
+    done += n;
+  }
+}
+
+static void playSound(SoundId id) {
+  if (id == SND_NONE) return;
+  if (!setupSpeaker()) return;
+
+  switch (id) {
+    case SND_LISTEN:
+      playToneSweep(660, 880, 90, 12000);
+      break;
+    case SND_HAPPY:
+      playToneSweep(700, 1100, 90, 12000);
+      playToneSweep(100, 100, 40, 0);
+      playToneSweep(900, 1400, 110, 12000);
+      break;
+    case SND_ANGRY:
+      playToneSweep(200, 160, 160, 12000);
+      playToneSweep(100, 100, 60, 0);
+      playToneSweep(190, 150, 200, 12000);
+      break;
+    case SND_YAWN:
+      playToneSweep(520, 220, 650, 9000);
+      break;
+    default:
+      break;
+  }
+
+  shutdownSpeaker();
+}
+
+// Davranis motorunun biraktigi istegi calar (yalnizca loop() cagirir).
+static void playPendingSound() {
+  SoundId id = pendingSound;
+  if (id == SND_NONE) return;
+  pendingSound = SND_NONE;
+  playSound(id);
 }
 
 // =====================================================================
@@ -1004,10 +1461,12 @@ static uint8_t ttsPlaybackBuffer[3074];
 static uint8_t ttsNetBuffer[1024];
 static volatile bool speechAbort = false;
 
+static uint32_t bargePressSeen = 0;
+
 // Konusma sirasinda dokunma = soz kesme.
 static void checkBargeIn() {
-    bool pressed = false, longPress = false;
-    pollTouch(pressed, longPress);
+    bool pressed = (touchPressSeq != bargePressSeen);
+    bargePressSeen = touchPressSeq;
 
     if (pressed && !speechAbort) {
         speechAbort = true;
@@ -1171,7 +1630,7 @@ static void ttsPlaybackTask(void *parameter) {
 
     if (!ttsPlaybackFailed) {
         MARK("ilk ses");
-        eyeState = EYE_SPEAKING;
+        appPhase = PHASE_SPEAKING;
 
         bool hasCarry = false;
         uint8_t carry = 0;
@@ -1226,6 +1685,7 @@ static void ttsPlaybackTask(void *parameter) {
         static_cast<unsigned int>(ttsPlayedBytes)
     );
 
+    ttsLevel = 0;
     ttsPlaybackFinished = true;
     vTaskDelete(nullptr);
 }
@@ -1670,6 +2130,7 @@ bool respondToTranscript(const String &transcript) {
     }
 
     speechAbort = false;
+    bargePressSeen = touchPressSeq;
     ttsPlaybackFailed = false;
     ttsFirstSentenceMarked = false;
     sentenceBacklog.clear();
@@ -1725,6 +2186,7 @@ bool respondToTranscript(const String &transcript) {
 
 // ---------- Konusma akisi ----------
 static bool systemReady = false;
+static uint32_t loopLongSeen = 0;
 
 static bool ensureWiFi() {
   if (WiFi.status() == WL_CONNECTED) return true;
@@ -1749,9 +2211,10 @@ static void runConversation() {
   }
 
   bool followUp = false;
+  bool endedBySilence = false;
 
   while (true) {
-    eyeState = EYE_LISTENING;
+    appPhase = PHASE_LISTENING;
 
     if (!followUp) {
       // Parmak cekilene kadar bekle (birakma sesi kaydi bozmasin).
@@ -1759,6 +2222,9 @@ static void runConversation() {
       while (digitalRead(TOUCH_PIN) == HIGH && millis() - t < 3000) {
         delay(10);
       }
+      delay(150);
+
+      playSound(SND_LISTEN);   // "simdi konusabilirsin" bipi
       delay(150);
     }
 
@@ -1774,6 +2240,7 @@ static void runConversation() {
     if (vad == VAD_NO_SPEECH) {
       Serial.println(followUp ? "[VAD] Takip suresi doldu; bosta."
                               : "[VAD] Konusma algilanmadi.");
+      endedBySilence = followUp;
       break;
     }
 
@@ -1782,7 +2249,7 @@ static void runConversation() {
       break;
     }
 
-    eyeState = EYE_THINKING;
+    appPhase = PHASE_THINKING;
     tStart = millis();   // Sureler konusma bittigi andan olculur.
 
     String transcript = transcribeAudio();
@@ -1807,9 +2274,9 @@ static void runConversation() {
     delay(400);   // Hoparlor yankisi mikrofona karismasin.
   }
 
-  eyeState = EYE_IDLE;
+  loopLongSeen = touchLongSeq;   // konusma sirasindaki uzun basmalar yeni konusma baslatmasin
+  appPhase = endedBySilence ? PHASE_FAREWELL : PHASE_IDLE;
 }
-
 // ---------- Program akisi ----------
 
 void setup() {
@@ -1821,12 +2288,11 @@ void setup() {
     return;
   }
 
-  startEyeTask();
-
   Serial.println("\n=== MasaDas ===");
 
   setupServo();
   setupTouch();
+  startBehaviorTask();
 
   if (String(WIFI_SSID).isEmpty() ||
       String(WIFI_PASSWORD).isEmpty() ||
@@ -1871,12 +2337,11 @@ void loop() {
     return;
   }
 
-  bool pressed = false, longPress = false;
-  pollTouch(pressed, longPress);
-
-  if (longPress) {
+  if (takeEvent(touchLongSeq, loopLongSeen)) {
     runConversation();
   }
 
+  playPendingSound();
   delay(10);
 }
+
