@@ -2470,7 +2470,7 @@ void setup() {
     return;
   }
 
-  if (!LittleFS.begin(false)) {
+  if (!LittleFS.begin(true)) {
     Serial.println("HATA: LittleFS acilamadi.");
     return;
   }
