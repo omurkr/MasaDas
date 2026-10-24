@@ -779,7 +779,7 @@ void shutdownMicrophone() {
 static constexpr uint32_t VAD_BLOCK_MS = BUFFER_SAMPLES * 1000 / SAMPLE_RATE;   // 16 ms
 static constexpr uint32_t VAD_FIRST_WAIT_MS = 6000;      // ilk tur: konusmaya baslama suresi
 static constexpr uint32_t VAD_FOLLOWUP_WAIT_MS = 10000;   // takip penceresi
-static constexpr uint32_t VAD_END_SILENCE_MS = 800;      // bu kadar sessizlik = bitti
+static constexpr uint32_t VAD_END_SILENCE_MS = 1800;     // bu kadar sessizlik = bitti
 static constexpr uint32_t VAD_MAX_SPEECH_MS = 8000;
 static constexpr int VAD_MIN_THRESHOLD = 150;            // ortalama mutlak genlik
 static constexpr int VAD_MAX_THRESHOLD = 800;
