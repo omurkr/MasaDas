@@ -2354,7 +2354,10 @@ static bool ensureWiFi() {
     delay(250);
   }
 
-  return WiFi.status() == WL_CONNECTED;
+  bool connected = WiFi.status() == WL_CONNECTED;
+  if (connected) WiFi.setSleep(false);   // yalnizca yeniden baglanma basariliysa
+
+  return connected;
 }
 
 // Uzun basmayla baslar; takip penceresinde konusuldukca tur tur surer.
@@ -2488,13 +2491,12 @@ void setup() {
   }
   Serial.println();
 
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("HATA: Wi-Fi baglantisi kurulamadi.");
-    return;
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFi.setSleep(false);   // Paket gecikmesi dalgalanmasini azaltir.
+    Serial.println("Wi-Fi baglandi.");
+  } else {
+    Serial.println("Wi-Fi yok; konuşma başlatılınca yeniden denenecek");
   }
-
-  WiFi.setSleep(false);   // Paket gecikmesi dalgalanmasini azaltir.
-  Serial.println("Wi-Fi baglandi.");
 
   loopLongSeen = touchLongSeq;
 
