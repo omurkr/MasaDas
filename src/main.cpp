@@ -2345,6 +2345,7 @@ static uint32_t loopLongSeen = 0;
 static bool ensureWiFi() {
   if (WiFi.status() == WL_CONNECTED) return true;
 
+  appPhase = PHASE_THINKING;   // bekleme animasyonu gorunsun
   Serial.println("Wi-Fi koptu, yeniden baglaniliyor...");
   WiFi.disconnect();
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -2357,6 +2358,7 @@ static bool ensureWiFi() {
   bool connected = WiFi.status() == WL_CONNECTED;
   if (connected) WiFi.setSleep(false);   // yalnizca yeniden baglanma basariliysa
 
+  appPhase = PHASE_IDLE;   // her cikis yolunda bosa don
   return connected;
 }
 
