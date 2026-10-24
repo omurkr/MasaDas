@@ -170,6 +170,8 @@ constexpr int TOUCH_PIN = 4;
 
 static constexpr unsigned long TOUCH_DEBOUNCE_MS = 40;
 static constexpr unsigned long TOUCH_LONG_PRESS_MS = 800;
+static constexpr unsigned long TOUCH_MIN_GAP_MS = 30;
+static constexpr unsigned long TOUCH_WARMUP_MS = 2000;
 
 // Olaylar sayac olarak tutulur; her tuketici kendi "son gordugum" degerini saklar.
 static volatile uint32_t touchPressSeq = 0;   // her basista artar
@@ -183,16 +185,28 @@ static bool takeEvent(volatile uint32_t &seq, uint32_t &seen) {
     return true;
 }
 
+static uint32_t convTapSeen = 0;
+static bool conversationCancelled() { return takeEvent(touchTapSeq, convTapSeen); }
+
 static void touchTask(void *parameter) {
     (void)parameter;
 
     int lastRaw = LOW, stable = LOW;
-    unsigned long lastChange = 0, pressStart = 0;
-    bool longFired = false;
+    unsigned long lastChange = 0, pressStart = 0, lastRelease = 0;
+    bool longFired = false, pressValid = false;
+    const unsigned long taskStart = millis();
 
     for (;;) {
         unsigned long now = millis();
         int raw = digitalRead(TOUCH_PIN);
+
+        if (now - taskStart < TOUCH_WARMUP_MS) {   // acilista olaylari yoksay
+            lastRaw = raw;
+            stable = raw;
+            lastChange = now;
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
 
         if (raw != lastRaw) {
             lastRaw = raw;
@@ -201,21 +215,25 @@ static void touchTask(void *parameter) {
 
         if (now - lastChange >= TOUCH_DEBOUNCE_MS && raw != stable) {
             stable = raw;
+            //Serial.printf("[TOUCH] %s\n", stable == HIGH ? "basildi" : "birakildi");
             lastInteractionMs = now;
 
             if (stable == HIGH) {
+                pressValid = (now - lastRelease >= TOUCH_MIN_GAP_MS);
                 pressStart = now;
                 longFired = false;
-                touchPressSeq = touchPressSeq + 1;
-            } else if (!longFired) {
-                touchTapSeq = touchTapSeq + 1;   // uzun basma degilse kisa dokunus
+                if (pressValid) touchPressSeq = touchPressSeq + 1;
+            } else {
+                lastRelease = now;
+                if (pressValid && !longFired) touchTapSeq = touchTapSeq + 1;
             }
         }
 
-        if (stable == HIGH && !longFired &&
+        if (stable == HIGH && pressValid && !longFired &&
             now - pressStart >= TOUCH_LONG_PRESS_MS) {
             longFired = true;
             touchLongSeq = touchLongSeq + 1;
+            //Serial.println("[TOUCH] uzun basma");
         }
 
         vTaskDelay(pdMS_TO_TICKS(5));
@@ -223,7 +241,7 @@ static void touchTask(void *parameter) {
 }
 
 void setupTouch() {
-    pinMode(TOUCH_PIN, INPUT);
+    pinMode(TOUCH_PIN, INPUT_PULLDOWN);
     xTaskCreate(touchTask, "Touch", 3072, nullptr, 1, nullptr);
     Serial.println("Touch sensor hazir.");
 }
@@ -240,8 +258,8 @@ static constexpr uint32_t ROAM_MIN_MS = 3000;
 static constexpr uint32_t ROAM_MAX_MS = 10000;
 static constexpr uint32_t DROWSY_AFTER_MS = 90000;    // test icin 10000 yapin
 static constexpr uint32_t SLEEP_AFTER_MS = 180000;    // test icin 20000 yapin
-static constexpr uint32_t ANGRY_TAP_COUNT = 4;
-static constexpr uint32_t ANGRY_TAP_WINDOW_MS = 4000;
+static constexpr uint32_t ANGRY_TAP_COUNT = 3;
+static constexpr uint32_t ANGRY_TAP_WINDOW_MS = 2000;
 static constexpr uint32_t LOVE_MS = 1600;
 static constexpr uint32_t ANGRY_MS = 3500;
 static constexpr uint32_t SHAKE_MS = 1300;            // 5 Hz x 1.3 sn = 6.5 salinim (merkezde biter)
@@ -593,6 +611,11 @@ static void behaviorStep() {
       enterMode(want);
     }
   } else {
+    if (lastPhase == PHASE_LISTENING || lastPhase == PHASE_THINKING || lastPhase == PHASE_SPEAKING) {
+      seenTap = touchTapSeq;
+      seenPress = touchPressSeq;
+      ignoreTapUntil = now + 300;
+    }
     if (bMode == B_THINK) {
       enterMode(B_UNTHINK);              // konusma bitti/iptal: once yumusakca goze don
     } else if (bMode == B_UNTHINK) {
@@ -768,7 +791,7 @@ static constexpr size_t VAD_TAIL_KEEP_BLOCKS = 8;        // sondaki sessizlikten
 static constexpr size_t VAD_MIN_SPEECH_BLOCKS = 16;      // ~160 ms'den kisa sesler gurultu sayilir
 static constexpr size_t VAD_SETTLE_BLOCKS = 14;          // mikrofon acilis gecicisini atla (~220 ms)
 
-enum VadResult { VAD_OK, VAD_NO_SPEECH, VAD_ERROR };
+enum VadResult { VAD_OK, VAD_NO_SPEECH, VAD_ERROR, VAD_CANCELLED };
 
 // Kayittan sonra STT'ye gonderilecek gercek WAV boyutu (dosya daha buyuk kalabilir).
 static size_t recordedWavBytes = 0;
@@ -896,6 +919,8 @@ static VadResult recordUtterance(uint32_t waitForSpeechMs) {
 
       continue;
     }
+
+    if (conversationCancelled()) { file.close(); return VAD_CANCELLED; }
 
     // 2) Konusma baslamasini bekle.
     if (!speaking) {
@@ -1585,14 +1610,10 @@ static uint8_t ttsPlaybackBuffer[3074];
 static uint8_t ttsNetBuffer[1024];
 static volatile bool speechAbort = false;
 
-static uint32_t bargePressSeen = 0;
 
 // Konusma sirasinda dokunma = soz kesme.
 static void checkBargeIn() {
-    bool pressed = (touchPressSeq != bargePressSeen);
-    bargePressSeen = touchPressSeq;
-
-    if (pressed && !speechAbort) {
+    if (conversationCancelled() && !speechAbort) {
         speechAbort = true;
         ttsPlaybackFailed = true;   // oynatici ve isci hemen durur
         Serial.println("[AKIS] Dokunma: konusma kesildi.");
@@ -2264,7 +2285,6 @@ bool respondToTranscript(const String &transcript) {
     }
 
     speechAbort = false;
-    bargePressSeen = touchPressSeq;
     ttsPlaybackFailed = false;
     ttsFirstSentenceMarked = false;
     sentenceBacklog.clear();
@@ -2361,6 +2381,8 @@ static void runConversation() {
 
       playSound(SND_LISTEN);   // "simdi konusabilirsin" bipi
       delay(150);
+
+      convTapSeen = touchTapSeq;
     }
 
     if (!setupMicrophone()) {
@@ -2379,6 +2401,8 @@ static void runConversation() {
       break;
     }
 
+    if (vad == VAD_CANCELLED) { Serial.println("[AKIS] Dinleme iptal."); break; }
+
     if (vad == VAD_ERROR) {
       Serial.println("HATA: Ses kaydi basarisiz.");
       break;
@@ -2389,6 +2413,8 @@ static void runConversation() {
 
     String transcript = transcribeAudio();
     MARK("STT bitti");
+
+    if (conversationCancelled()) { Serial.println("[AKIS] STT sirasinda iptal."); break; }
 
     if (transcript.isEmpty()) {
       if (sttWasEmpty && ++emptyCount <= 2) {
@@ -2469,6 +2495,8 @@ void setup() {
 
   WiFi.setSleep(false);   // Paket gecikmesi dalgalanmasini azaltir.
   Serial.println("Wi-Fi baglandi.");
+
+  loopLongSeen = touchLongSeq;
 
   systemReady = true;
   Serial.println("\nHazir. Konusmak icin touch sensorune uzun bas.");
