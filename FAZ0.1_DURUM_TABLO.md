@@ -78,3 +78,24 @@ Bu tablo koddan okunarak çıkarıldı; cihazda doğrulanmış sonuç anlamına 
 | 5.4 Wi-Fi kesintisi/boş STT/API hatası/sessizlik | Kısmen | 2345–2358, 2419–2428 | Kod yolları var, test sonucu yok. |
 | 5.5 Uzun süreli çalıştırma | Yok | — | Test yapılmadı; `millis()` karşılaştırmalarının 49,7 gün taşması kontrol edilmedi. |
 | 5.6 Kararlı sürümü Git'e kaydet | Yok | — | `git tag` boş; çalışma ağacında kaydedilmemiş değişiklik var. |
+
+## Test sonuçları
+
+| Test | Sonuç |
+|---|---|
+| A Açılış | Geçti |
+| B Dokunma | Geçti |
+| C Ses akışı | Geçti (C2: 10 denemede 1 belirgin takılma + birkaç milisaniyelik boşluk) |
+| D Hata durumları | Geçti |
+| E Animasyon | Geçti |
+| F Dayanıklılık (30–60 dk) | Test edilmedi |
+
+## Bilinen sınırlamalar
+
+- Tek konuşma ~8 sn ile sınırlı (`VAD_MAX_SPEECH_MS` 8000, STT dosya sınırı 300000 B). 30 sn denemesi daha önce sesi bozdu (kullanıcı bildirdi); Faz 0.1'de denenmeyecek.
+- Cümleler arasında nadir kısa boşluk (her cümle ayrı TTS isteği).
+- STT/LLM beklerken dokunmayla iptal gecikmeli.
+- Hata durumunda görsel geri bildirim yok (`8dd1b76`, `hata-bildirimi-denemesi` dalında; sesi bozduğu için alınmadı).
+- Ses akışı küçük kod değişikliklerine aşırı duyarlı.
+- Donanım: Sürekli Wi-Fi yeniden deneme sırasında servo hırlaması ve dokunma sensörü takılması görüldü. Servo 5V hattına 470 µF, dokunma sensörü 3.3V hattına 10 µF kondansatör (breadboard) eklenince servo hırlaması ve hareket sorunu gözle düzeldi. Kod değişmedi. Sonraki PCB/donanım sürümüne kondansatörler kalıcı eklenecek. Dokunma sensörü takılması: DÜZELDİ.
+- Test edilmeyen/ertelenen: uzun süreli dayanıklılık (F), `finishSpeechPipeline` süre sınırı, LLM toplam süre sınırı, `millis()` 49,7 gün taşması, OLED başlamazsa robotun çalışmaması, `xTaskCreate` dönüş kontrolü, `/recording.wav` silinmemesi, kullanılmayan kod (`prev`, servo detach dalı).
