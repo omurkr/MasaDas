@@ -304,6 +304,13 @@ static bool headDelayArmed = false;
 static uint32_t headDelayAt = 0;
 static float headDelayTarget = SERVO_CENTER;
 
+// Etkinlik yoneticisi (ayrintisi behaviorStep'in ustunde). Roam adimi bosta sessiz animasyon baslatir.
+enum ActId : uint8_t { ACT_NONE, ACT_ANIM, ACT_COUNT };
+enum AnimId : uint8_t { ANIM_LAUGH, ANIM_SURPRISE, ANIM_SWEAT, ANIM_SCAN, ANIM_GLITCH, ANIM_HEARTS, ANIM_DIZZY, ANIM_COUNT };
+static uint32_t lastAnimAt = 0;
+static constexpr int32_t ANIM_QUIET_BASE = 100;   // arg >= 100: sessiz (bosta rastgele tetiklenen) animasyon
+static void activityStart(uint8_t id, int32_t arg);
+
 
 static void applyEyeHeight(int h) {
   if (h == appliedHeight) return;
@@ -466,6 +473,8 @@ static void roamStep(uint32_t now) {
     evt = EVT_YAWN_OPEN;
     evtAt = now + 1300;
     nextRoamAt = now + 5000;
+  } else if (r < 30 && now - lastAnimAt > 25000) {          // bosta ara sira rastgele (sessiz) animasyon
+    activityStart(ACT_ANIM, ANIM_QUIET_BASE + random(0, ANIM_COUNT));
   } else {                                        // normal: yeni konuma bak
     int idx;
     do { idx = random(0, 9); } while (idx == gazeIndex);
@@ -586,6 +595,282 @@ static void drawLoader(uint32_t now) {
   display.display();
 }
 
+// =====================================================================
+//  Etkinlikler (Activity): ekrani gecici olarak devralan modlar
+//  Yalnizca behaviorTask cizer ve calistirir; yalnizca konusma yokken (!inConversation).
+//  Tum etkinlikler uzun basmayi tutar: konusma bir etkinlik acikken baslamaz.
+// =====================================================================
+
+enum ActEvent : uint8_t { AEV_TAP, AEV_LONG, AEV_PRESS };   // PRESS: parmak degdi (birakma beklenmez)
+
+struct Activity {
+  const char *name;
+  void (*onEnter)(int32_t arg);
+  void (*onEvent)(ActEvent e);
+  void (*onTick)(uint32_t now);
+  void (*render)(uint32_t now);
+  void (*onExit)();
+};
+
+static const Activity *curAct = nullptr;
+static uint8_t curActId = ACT_NONE;
+static volatile bool actHoldsLong = false;     // loop() bakar: true iken uzun basma konusma baslatmaz
+static volatile uint32_t longHandledAt = 0;    // etkinligin tukettigi son uzun basma
+static uint32_t seenLongB = 0;
+static uint32_t actSince = 0;
+static bool actExitRequested = false;
+static int pendingActId = -1;                  // bir etkinlik baska birini baslatmak ister (or. menu)
+static int32_t pendingActArg = 0;
+
+static void activityFinish() { actExitRequested = true; }
+static void activityRequest(uint8_t id, int32_t arg) { pendingActId = id; pendingActArg = arg; }
+
+// ---- OLED animasyon paketi ----
+// Kutuphanede hazir: kahkaha (laugh), saskin (confused), ter (sweat), titreme (flicker), tek goz (cyclops).
+// Ozel cizim: kalpli goz, bas donmesi.
+static constexpr uint32_t ANIM_DURATION_MS[ANIM_COUNT] = {3000, 2400, 3500, 4200, 2200, 3000, 3200};
+static const char *const ANIM_NAMES[ANIM_COUNT] = {"Kahkaha", "Saskin", "Gergin", "Tarama", "Titreme", "Kalpli goz", "Bas donmesi"};
+
+static uint8_t animId = ANIM_LAUGH;
+static uint32_t animNext = 0;
+static uint8_t animStepIdx = 0;
+static bool animInverted = false;
+
+static const uint8_t SCAN_SEQ[] = {7, 3, 7, 3, 0};   // GAZE_POS: W, E, W, E, orta
+
+static void animEnter(int32_t arg) {
+  bool quiet = arg >= ANIM_QUIET_BASE;
+  if (quiet) arg -= ANIM_QUIET_BASE;
+
+  animId = (arg >= 0 && arg < ANIM_COUNT) ? static_cast<uint8_t>(arg)
+                                          : static_cast<uint8_t>(random(0, ANIM_COUNT));
+  animNext = actSince;
+  animStepIdx = 0;
+  animInverted = false;
+  lastAnimAt = actSince;
+
+  roboEyes.open();
+  roboEyes.setMood(DEFAULT);
+  roboEyes.setAutoblinker(ON, 3, 2);
+  eyesLook(0, false);
+  headMoveTo(SERVO_CENTER);
+
+  switch (animId) {
+    case ANIM_LAUGH:
+      roboEyes.setMood(HAPPY);
+      break;
+    case ANIM_SURPRISE:
+      applyEyeHeight(46);
+      roboEyes.setWidth(42, 42);
+      roboEyes.setAutoblinker(OFF, 3, 2);
+      break;
+    case ANIM_SWEAT:
+      roboEyes.setSweat(true);
+      roboEyes.setHFlicker(true, 1);
+      break;
+    case ANIM_SCAN:
+      roboEyes.setCyclops(true);
+      break;
+    case ANIM_HEARTS:
+      if (!quiet) pendingSound = SND_HAPPY;
+      break;
+    default:
+      break;
+  }
+}
+
+static void animEvent(ActEvent e) {
+  if (e == AEV_TAP || e == AEV_LONG) activityFinish();   // dokunma animasyonu erken bitirir
+}
+
+static void animTick(uint32_t now) {
+  uint32_t t = now - actSince;
+  if (t >= ANIM_DURATION_MS[animId]) { activityFinish(); return; }
+
+  switch (animId) {
+    case ANIM_LAUGH:
+      if (!roboEyes.laugh) roboEyes.anim_laugh();
+      break;
+
+    case ANIM_SURPRISE:
+      if (t > 350 && animStepIdx == 0) {
+        roboEyes.anim_confused();
+        animStepIdx = 1;
+      }
+      break;
+
+    case ANIM_SWEAT:
+      if (now >= animNext) {
+        eyesLook((animStepIdx++ & 1) ? 3 : 7, false);
+        animNext = now + 550;
+      }
+      break;
+
+    case ANIM_SCAN:      // bakis yonune bas da eslik eder
+      if (now >= animNext) {
+        eyesLook(SCAN_SEQ[animStepIdx % sizeof(SCAN_SEQ)], true);
+        animStepIdx++;
+        animNext = now + 800;
+      }
+      break;
+
+    case ANIM_GLITCH:
+      if (now >= animNext) {
+        bool burst = random(0, 100) < 55;
+        roboEyes.setHFlicker(burst, 3);
+        roboEyes.setVFlicker(burst, 5);
+        animInverted = burst && random(0, 100) < 40;
+        display.invertDisplay(animInverted);
+        animNext = now + random(90, 260);
+      }
+      break;
+
+    case ANIM_DIZZY:     // bas saga sola salinir
+      headMoving = false;
+      headWriteAngle(SERVO_CENTER + 12.0f * sinf(now / 170.0f));
+      break;
+
+    default:
+      break;
+  }
+}
+
+static void drawHeart(int cx, int cy, int r) {
+  display.fillCircle(cx - r, cy - r / 2, r, SH110X_WHITE);
+  display.fillCircle(cx + r, cy - r / 2, r, SH110X_WHITE);
+  display.fillTriangle(cx - 2 * r, cy - 1, cx + 2 * r, cy - 1, cx, cy + 2 * r + 2, SH110X_WHITE);
+}
+
+static void drawSpiral(int cx, int cy, float phase) {
+  float px = cx, py = cy;
+  for (int k = 1; k <= 30; k++) {
+    float th = k * 0.55f + phase;
+    float rad = 0.6f * k;
+    float x = cx + rad * cosf(th);
+    float y = cy + rad * sinf(th);
+    display.drawLine(lroundf(px), lroundf(py), lroundf(x), lroundf(y), SH110X_WHITE);
+    px = x;
+    py = y;
+  }
+}
+
+static void animRender(uint32_t now) {
+  if (animId != ANIM_HEARTS && animId != ANIM_DIZZY) {
+    roboEyes.update();
+    return;
+  }
+
+  static uint32_t lastDraw = 0;
+  if (now - lastDraw < 30) return;
+  lastDraw = now;
+
+  const int cxL = (OLED_WIDTH - (2 * EYE_BASE_WIDTH + EYE_GAP)) / 2 + EYE_BASE_WIDTH / 2;
+  const int cxR = cxL + EYE_BASE_WIDTH + EYE_GAP;
+  const int cy = OLED_HEIGHT / 2;
+
+  display.clearDisplay();
+
+  if (animId == ANIM_HEARTS) {
+    int r = lroundf(8.0f + 2.0f * sinf(now / 110.0f));
+    drawHeart(cxL, cy, r);
+    drawHeart(cxR, cy, r);
+  } else {
+    float ph = now / 140.0f;
+    drawSpiral(cxL, cy, ph);
+    drawSpiral(cxR, cy, ph);
+  }
+
+  display.display();
+}
+
+static void animExit() {
+  roboEyes.setSweat(false);
+  roboEyes.setHFlicker(false, 2);
+  roboEyes.setVFlicker(false, 10);
+  roboEyes.setCyclops(false);
+  roboEyes.setWidth(EYE_BASE_WIDTH, EYE_BASE_WIDTH);
+  roboEyes.laugh = false;
+  roboEyes.confused = false;
+  animInverted = false;
+  display.invertDisplay(false);
+}
+
+static const Activity ACTIVITIES[ACT_COUNT] = {
+  {"Gozler", nullptr, nullptr, nullptr, nullptr, nullptr},                       // ACT_NONE (kullanilmaz)
+  {"Animasyon", animEnter, animEvent, animTick, animRender, animExit},           // ACT_ANIM
+};
+
+static void activityStop() {
+  if (curAct == nullptr) return;
+
+  const Activity *a = curAct;
+  curAct = nullptr;
+  curActId = ACT_NONE;
+  actHoldsLong = false;
+  actExitRequested = false;
+
+  if (a->onExit) a->onExit();
+
+  enterMode(B_ROAM);            // gozleri bastan kur (mood, boyut, bakis)
+  lastInteractionMs = millis();
+}
+
+static void activityStart(uint8_t id, int32_t arg) {
+  if (id == ACT_NONE || id >= ACT_COUNT) return;
+
+  if (curAct != nullptr && curAct->onExit) curAct->onExit();
+
+  uint32_t now = millis();
+  curAct = &ACTIVITIES[id];
+  curActId = id;
+  actSince = now;
+  actExitRequested = false;
+  actHoldsLong = true;
+
+  lastInteractionMs = now;
+  seenPress = touchPressSeq;
+  seenTap = touchTapSeq;
+  seenLongB = touchLongSeq;
+  evt = EVT_NONE;
+  headDelayArmed = false;
+
+  if (curAct->onEnter) curAct->onEnter(arg);
+}
+
+// Etkinlik surerken her adimda cagrilir (yalnizca konusma yokken).
+static void activityStep(uint32_t now) {
+  bool pressed = (touchPressSeq != seenPress);
+  bool tapped = (touchTapSeq != seenTap);
+  seenTap = touchTapSeq;
+  seenPress = touchPressSeq;
+
+  if (pressed && curAct->onEvent) curAct->onEvent(AEV_PRESS);
+  if (tapped && curAct->onEvent) curAct->onEvent(AEV_TAP);
+
+  if (takeEvent(touchLongSeq, seenLongB)) {
+    longHandledAt = now == 0 ? 1 : now;    // loop() bu uzun basmayi konusmaya cevirmesin
+    if (curAct->onEvent) curAct->onEvent(AEV_LONG);
+  }
+
+  if (!actExitRequested && pendingActId < 0 && curAct->onTick) curAct->onTick(now);
+
+  if (pendingActId >= 0) {                 // baska etkinlige gecis
+    uint8_t id = static_cast<uint8_t>(pendingActId);
+    int32_t arg = pendingActArg;
+    pendingActId = -1;
+    activityStart(id, arg);
+    return;
+  }
+
+  if (actExitRequested) {
+    activityStop();
+    return;
+  }
+
+  headUpdate();
+  if (curAct->render) curAct->render(now);
+}
+
 static void behaviorStep() {
   uint32_t now = millis();
   AppPhase phase = appPhase;
@@ -624,6 +909,12 @@ static void behaviorStep() {
       enterMode(B_FAREWELL);
     } else if (bMode == B_LISTEN || bMode == B_SPEAK) {
       enterMode(B_ROAM);
+    }
+
+    if (curAct != nullptr) {                   // etkinlik surerken (yalnizca konusma yokken)
+      lastPhase = phase;
+      activityStep(now);
+      return;
     }
 
     if (bMode != B_UNTHINK) handleTouchIdle(now);
@@ -2513,7 +2804,10 @@ void loop() {
   }
 
   if (takeEvent(touchLongSeq, loopLongSeen)) {
-    runConversation();
+    // Uzun basmayi tutan etkinlik (animasyon, saat, oyun...) varsa konusma baslamaz.
+    uint32_t handled = longHandledAt;
+    bool consumed = actHoldsLong || (handled != 0 && millis() - handled < 600);
+    if (!consumed) runConversation();
   }
 
   playPendingSound();
