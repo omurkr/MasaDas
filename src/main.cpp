@@ -3040,7 +3040,8 @@ static bool finishSpeechPipeline(bool workerStarted) {
         "En fazla 1-2 cumle kullan. Gereksiz aciklama yapma. "
         "Kullanicinin sorusuna dogrudan cevap ver. "
         "Samimi ama abartisiz bir uslup kullan. Emoji kullanma. "
-        "Sayilari rakamla degil yaziyla yaz (ornek: yirmi uc).";
+        "Sayilari rakamla degil yaziyla yaz (ornek: yirmi uc). "
+        "Yanıtın en fazla 12 kelime olsun, tek kısa cümle, soru sorma.";
 
     JsonObject userMessage = messages.add<JsonObject>();
     userMessage["role"] = "user";
