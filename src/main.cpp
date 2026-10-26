@@ -19,6 +19,7 @@
 #include <freertos/queue.h>
 #include <freertos/stream_buffer.h>
 #include <vector>
+#include <esp_sntp.h>
 #include "logic/timer_logic.h"
 #include "logic/game_logic.h"
 #include <Preferences.h>
@@ -299,8 +300,9 @@ static uint32_t nextRoamAt = 0;
 static uint32_t shakeStartAt = 0;
 static uint32_t ignoreTapUntil = 0;
 static uint32_t seenPress = 0, seenTap = 0;
-static uint32_t tapTimes[ANGRY_TAP_COUNT] = {0};
-static uint8_t tapIndex = 0;
+static constexpr uint32_t TAP_GROUP_MS = 450;   // ayni dokunus grubu: ardisik dokunuslar arasi en cok bu kadar bosluk
+static uint8_t idleTapCount = 0;
+static uint32_t idleLastTapAt = 0;
 static int gazeIndex = 0;
 static AppPhase lastPhase = PHASE_IDLE;
 static uint8_t smoothLevel = 0;
@@ -312,7 +314,7 @@ static uint32_t headDelayAt = 0;
 static float headDelayTarget = SERVO_CENTER;
 
 // Etkinlik yoneticisi (ayrintisi behaviorStep'in ustunde). Roam adimi bosta sessiz animasyon baslatir.
-enum ActId : uint8_t { ACT_NONE, ACT_ANIM, ACT_TIMER, ACT_ALARM, ACT_REACTION, ACT_DOTS, ACT_COUNT };
+enum ActId : uint8_t { ACT_NONE, ACT_ANIM, ACT_TIMER, ACT_ALARM, ACT_REACTION, ACT_DOTS, ACT_CLOCK, ACT_MENU, ACT_COUNT };
 enum AnimId : uint8_t { ANIM_LAUGH, ANIM_SURPRISE, ANIM_SWEAT, ANIM_SCAN, ANIM_GLITCH, ANIM_HEARTS, ANIM_DIZZY, ANIM_COUNT };
 static uint32_t lastAnimAt = 0;
 static constexpr int32_t ANIM_QUIET_BASE = 100;   // arg >= 100: sessiz (bosta rastgele tetiklenen) animasyon
@@ -434,6 +436,7 @@ static void handleTouchIdle(uint32_t now) {
   seenTap = touchTapSeq;
 
   if (bMode == B_SLEEP || bMode == B_DROWSY) {
+    idleTapCount = 0;
     if (pressed) {
       ignoreTapUntil = now + 1200;        // uyandiran dokunus "sevilme" sayilmasin
       enterMode(B_WAKING);
@@ -441,22 +444,21 @@ static void handleTouchIdle(uint32_t now) {
     return;
   }
 
-  if (bMode == B_WAKING || bMode == B_ANGRY) return;
-  if (!tapped || now < ignoreTapUntil) return;
+  if (bMode == B_WAKING || bMode == B_ANGRY) { idleTapCount = 0; return; }
 
-  tapTimes[tapIndex] = now;
-  tapIndex = (tapIndex + 1) % ANGRY_TAP_COUNT;
-
-  uint32_t recent = 0;
-  for (uint32_t t : tapTimes) {
-    if (t != 0 && now - t <= ANGRY_TAP_WINDOW_MS) recent++;
+  if (tapped && now >= ignoreTapUntil) {
+    idleTapCount++;
+    idleLastTapAt = now;
   }
 
-  if (recent >= ANGRY_TAP_COUNT) {
-    memset(tapTimes, 0, sizeof(tapTimes));
-    enterMode(B_ANGRY);
-  } else {
-    enterMode(B_LOVE);
+  // Dokunuslar bitince (bosluk dolunca) say: 1 mutlu, 2 menu, 3+ ofke.
+  if (idleTapCount > 0 && now - idleLastTapAt >= TAP_GROUP_MS) {
+    uint8_t n = idleTapCount;
+    idleTapCount = 0;
+
+    if (n >= ANGRY_TAP_COUNT) enterMode(B_ANGRY);
+    else if (n == 2) activityStart(ACT_MENU, 0);
+    else enterMode(B_LOVE);
   }
 }
 
@@ -1178,6 +1180,207 @@ static void gamesPersist() {
   }
 }
 
+// ---- Saat: acilista tek NTP eslesmesi (UTC+3), sonra SNTP kapatilir; saat sistem zamaniyla surer ----
+static bool ntpSynced = false;
+static bool ntpWaiting = false;
+static uint32_t ntpStartAt = 0;
+static uint32_t ntpNextTry = 0;
+
+// Beklemez; sistem zamani gecerli bir yila ulasmissa true.
+static bool localClock(struct tm &ti) {
+  time_t t = time(nullptr);
+  localtime_r(&t, &ti);
+  return ti.tm_year > (2020 - 1900);
+}
+
+// loop() cagirir (yalnizca konusma yokken). Basarisiz olursa 5 dk sonra yeniden dener.
+static void ntpMaintain() {
+  if (ntpSynced || WiFi.status() != WL_CONNECTED) return;
+
+  uint32_t now = millis();
+  struct tm ti;
+
+  if (!ntpWaiting) {
+    if (now < ntpNextTry) return;
+    configTime(3 * 3600, 0, "pool.ntp.org", "time.google.com");   // UTC+3
+    ntpWaiting = true;
+    ntpStartAt = now;
+    return;
+  }
+
+  if (localClock(ti)) {
+    ntpSynced = true;
+    ntpWaiting = false;
+    esp_sntp_stop();                    // tek eslesme yeter; arka plan SNTP agi mesgul etmesin
+    return;
+  }
+
+  if (now - ntpStartAt > 10000) {
+    esp_sntp_stop();
+    ntpWaiting = false;
+    ntpNextTry = now + 300000;
+  }
+}
+
+// ---- Saat ekrani ----
+static constexpr uint32_t CLOCK_EYES_CLOSE_MS = 400;   // goz kapanir, sonra saat gelir
+static bool clockShowSeconds = false;
+
+static void clockEnter(int32_t) {
+  clockShowSeconds = false;
+  roboEyes.setAutoblinker(OFF, 3, 2);
+  eyesLook(0, false);
+  headMoveTo(SERVO_CENTER);
+  roboEyes.close();
+}
+
+static void clockEvent(ActEvent e) {
+  if (e == AEV_LONG) activityFinish();            // gozlere don
+  else if (e == AEV_TAP) clockShowSeconds = !clockShowSeconds;
+}
+
+static void clockRender(uint32_t now) {
+  if (now - actSince < CLOCK_EYES_CLOSE_MS) {
+    roboEyes.update();
+    return;
+  }
+
+  static uint32_t lastDraw = 0;
+  if (now - lastDraw < 100) return;
+  lastDraw = now;
+
+  // Ekran yanmasini azaltmak icin gorunum dakikada bir birkac piksel kayar.
+  uint32_t minute = (now - actSince) / 60000;
+  int offX = (static_cast<int>(minute % 5) - 2) * 2;
+  int offY = (static_cast<int>(minute % 3) - 1) * 2;
+
+  display.clearDisplay();
+  display.setTextColor(SH110X_WHITE);
+
+  struct tm ti;
+  if (localClock(ti)) {
+    char two[4];
+    display.setTextSize(4);
+
+    snprintf(two, sizeof(two), "%02d", ti.tm_hour);
+    display.setCursor(4 + offX, 10 + offY);
+    display.print(two);
+
+    display.setCursor(52 + offX, 10 + offY);
+    display.print(((now / 500) % 2 == 0) ? ":" : " ");
+
+    snprintf(two, sizeof(two), "%02d", ti.tm_min);
+    display.setCursor(76 + offX, 10 + offY);
+    display.print(two);
+
+    display.setTextSize(1);
+    char line[24];
+    if (clockShowSeconds) snprintf(line, sizeof(line), "%02d.%02d.%04d  :%02d", ti.tm_mday, ti.tm_mon + 1, ti.tm_year + 1900, ti.tm_sec);
+    else snprintf(line, sizeof(line), "%02d.%02d.%04d", ti.tm_mday, ti.tm_mon + 1, ti.tm_year + 1900);
+    display.setCursor(4 + offX, 52 + offY);
+    display.print(line);
+  } else {
+    display.setTextSize(1);
+    display.setCursor(0, 20);
+    display.print(WiFi.status() == WL_CONNECTED ? "Saat ayarlaniyor..." : "Wi-Fi yok: saat yok");
+    display.setCursor(0, 40);
+    display.print("Uzun bas: gozler");
+  }
+
+  display.display();
+}
+
+// ---- Menu: bostayken cift dokunma acar; dokun = ileri, uzun bas = sec, 10 sn dokunulmazsa gozler ----
+static constexpr uint32_t MENU_IDLE_MS = 10000;
+
+static const char *const MENU_MAIN[] = {"Saat", "Pomodoro", "Zamanlayici", "Tepki", "Nokta", "Animasyon"};
+static const char *const MENU_TIMER[] = {"1 dakika", "3 dakika", "5 dakika", "10 dakika", "15 dakika", "< Geri"};
+static const uint8_t MENU_TIMER_MIN[] = {1, 3, 5, 10, 15};
+static const char *const MENU_ANIM[] = {ANIM_NAMES[0], ANIM_NAMES[1], ANIM_NAMES[2], ANIM_NAMES[3],
+                                        ANIM_NAMES[4], ANIM_NAMES[5], ANIM_NAMES[6], "< Geri"};
+
+static uint8_t menuPage = 0;      // 0 ana, 1 zamanlayici sureleri, 2 animasyonlar
+static uint8_t menuIdx = 0;
+static uint32_t menuLastTouch = 0;
+
+static uint8_t menuCount() {
+  return menuPage == 0 ? 6 : (menuPage == 1 ? 6 : 8);
+}
+
+static const char *menuLabel(uint8_t i) {
+  return menuPage == 0 ? MENU_MAIN[i] : (menuPage == 1 ? MENU_TIMER[i] : MENU_ANIM[i]);
+}
+
+static void menuEnter(int32_t) {
+  menuPage = 0;
+  menuIdx = 0;
+  menuLastTouch = actSince;
+  roboEyes.setAutoblinker(OFF, 3, 2);
+  roboEyes.open();
+}
+
+static void menuSelect() {
+  uint32_t now = millis();
+
+  if (menuPage == 0) {
+    switch (menuIdx) {
+      case 0: activityRequest(ACT_CLOCK, 0); break;
+      case 1: pomo.startPomodoro(now); activityRequest(ACT_TIMER, 0); break;
+      case 2: menuPage = 1; menuIdx = 0; break;
+      case 3: activityRequest(ACT_REACTION, 0); break;
+      case 4: activityRequest(ACT_DOTS, 0); break;
+      case 5: menuPage = 2; menuIdx = 0; break;
+    }
+  } else if (menuPage == 1) {
+    if (menuIdx < 5) {
+      pomo.startFree(now, static_cast<uint32_t>(MENU_TIMER_MIN[menuIdx]) * 60000UL);
+      activityRequest(ACT_TIMER, 0);
+    } else {
+      menuPage = 0;
+      menuIdx = 2;
+    }
+  } else {
+    if (menuIdx < ANIM_COUNT) activityRequest(ACT_ANIM, menuIdx);
+    else { menuPage = 0; menuIdx = 5; }
+  }
+}
+
+static void menuEvent(ActEvent e) {
+  if (e == AEV_PRESS) menuLastTouch = millis();
+  else if (e == AEV_TAP) menuIdx = (menuIdx + 1) % menuCount();
+  else if (e == AEV_LONG) menuSelect();
+}
+
+static void menuTick(uint32_t now) {
+  if (now - menuLastTouch >= MENU_IDLE_MS) activityFinish();   // 10 sn dokunulmadi: gozlere don
+}
+
+static void menuRender(uint32_t now) {
+  static uint32_t lastDraw = 0;
+  if (now - lastDraw < 100) return;
+  lastDraw = now;
+
+  char line[24];
+  display.clearDisplay();
+  display.setTextColor(SH110X_WHITE);
+  display.setTextSize(1);
+
+  display.setCursor(0, 0);
+  display.print(menuPage == 0 ? "MENU" : (menuPage == 1 ? "ZAMANLAYICI" : "ANIMASYON"));
+  snprintf(line, sizeof(line), "%u/%u", static_cast<unsigned>(menuIdx + 1), static_cast<unsigned>(menuCount()));
+  display.setCursor(104, 0);
+  display.print(line);
+
+  display.setTextSize(2);
+  display.setCursor(0, 22);
+  display.print(menuLabel(menuIdx));
+
+  display.setTextSize(1);
+  display.setCursor(0, 56);
+  display.print("dokun: ileri  uzun: sec");
+  display.display();
+}
+
 static const Activity ACTIVITIES[ACT_COUNT] = {
   {"Gozler", nullptr, nullptr, nullptr, nullptr, nullptr},                       // ACT_NONE (kullanilmaz)
   {"Animasyon", animEnter, animEvent, animTick, animRender, animExit},           // ACT_ANIM
@@ -1185,6 +1388,8 @@ static const Activity ACTIVITIES[ACT_COUNT] = {
   {"Alarm", alarmEnter, alarmEvent, alarmTick, alarmRender, alarmExit},          // ACT_ALARM
   {"Tepki oyunu", reactEnter, reactEvent, reactTick, reactRender, nullptr},      // ACT_REACTION
   {"Nokta oyunu", dotsEnter, dotsEvent, dotsTick, dotsRender, nullptr},          // ACT_DOTS
+  {"Saat", clockEnter, clockEvent, nullptr, clockRender, nullptr},               // ACT_CLOCK
+  {"Menu", menuEnter, menuEvent, menuTick, menuRender, nullptr},                 // ACT_MENU
 };
 
 static void activityStop() {
@@ -3218,6 +3423,7 @@ void loop() {
     if (!consumed) runConversation();
   }
 
+  ntpMaintain();    // acilista tek NTP eslesmesi, sonra SNTP kapali
   gamesPersist();   // yeni rekor varsa NVS'e yazar (loop yalnizca konusma yokken buraya gelir)
   playPendingSound();
   delay(10);
