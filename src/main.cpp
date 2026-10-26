@@ -19,6 +19,7 @@
 #include <freertos/queue.h>
 #include <freertos/stream_buffer.h>
 #include <vector>
+#include "logic/timer_logic.h"
 
 // ---------- Sure olcumu ----------
 static uint32_t tStart = 0;
@@ -50,7 +51,7 @@ enum AppPhase : uint8_t {
   PHASE_FAREWELL    // konusma sessizlikle bitti
 };
 
-enum SoundId : uint8_t { SND_NONE, SND_LISTEN, SND_HAPPY, SND_ANGRY, SND_YAWN };
+enum SoundId : uint8_t { SND_NONE, SND_LISTEN, SND_HAPPY, SND_ANGRY, SND_YAWN, SND_ALARM };
 
 static volatile AppPhase appPhase = PHASE_IDLE;
 static volatile uint8_t ttsLevel = 0;               // 0..255, calan sesin siddeti
@@ -305,7 +306,7 @@ static uint32_t headDelayAt = 0;
 static float headDelayTarget = SERVO_CENTER;
 
 // Etkinlik yoneticisi (ayrintisi behaviorStep'in ustunde). Roam adimi bosta sessiz animasyon baslatir.
-enum ActId : uint8_t { ACT_NONE, ACT_ANIM, ACT_COUNT };
+enum ActId : uint8_t { ACT_NONE, ACT_ANIM, ACT_TIMER, ACT_ALARM, ACT_COUNT };
 enum AnimId : uint8_t { ANIM_LAUGH, ANIM_SURPRISE, ANIM_SWEAT, ANIM_SCAN, ANIM_GLITCH, ANIM_HEARTS, ANIM_DIZZY, ANIM_COUNT };
 static uint32_t lastAnimAt = 0;
 static constexpr int32_t ANIM_QUIET_BASE = 100;   // arg >= 100: sessiz (bosta rastgele tetiklenen) animasyon
@@ -795,9 +796,170 @@ static void animExit() {
   display.invertDisplay(false);
 }
 
+// ---- Zamanlayici (pomodoro / serbest sure): yalnizca konusma yokken ilerler ----
+using PomoMode = timerlogic::PomodoroTimer::Mode;
+
+static timerlogic::PomodoroTimer pomo;
+static bool alarmPending = false;
+static PomoMode alarmMode = timerlogic::PomodoroTimer::M_IDLE;
+
+static void timerTick(uint32_t now) {
+  if (pomo.update(now)) {
+    alarmMode = pomo.finishedMode();
+    alarmPending = true;
+  }
+}
+
+static void formatMmSs(char *buf, size_t cap, uint32_t ms) {
+  uint32_t sec = (ms + 999) / 1000;
+  snprintf(buf, cap, "%02lu:%02lu", static_cast<unsigned long>(sec / 60),
+           static_cast<unsigned long>(sec % 60));
+}
+
+// ---- Zamanlayici ekrani ----
+static uint32_t timerLastTap = 0;
+
+static void timerEnter(int32_t) { timerLastTap = 0; }
+
+static void timerEvent(ActEvent e) {
+  uint32_t now = millis();
+
+  if (e == AEV_LONG) {          // zamanlayici arka planda surer
+    activityFinish();
+    return;
+  }
+  if (e != AEV_TAP) return;
+
+  if (!pomo.active()) {         // bosta: dokunma pomodoro baslatir
+    pomo.startPomodoro(now);
+    timerLastTap = 0;
+    return;
+  }
+
+  if (timerLastTap != 0 && now - timerLastTap < 600) {   // cift dokunma = sifirla
+    pomo.reset();
+    timerLastTap = 0;
+    activityFinish();
+    return;
+  }
+
+  pomo.togglePause(now);        // tek dokunma = duraklat / devam
+  timerLastTap = now;
+}
+
+static void timerRender(uint32_t now) {
+  static uint32_t lastDraw = 0;
+  if (now - lastDraw < 100) return;
+  lastDraw = now;
+
+  display.clearDisplay();
+  display.setTextColor(SH110X_WHITE);
+  display.setTextSize(1);
+
+  if (!pomo.active()) {
+    display.setCursor(0, 8);
+    display.print("Zamanlayici yok");
+    display.setCursor(0, 26);
+    display.print("Dokun: pomodoro basla");
+    display.setCursor(0, 42);
+    display.print("Uzun bas: gozler");
+    display.display();
+    return;
+  }
+
+  char head[24];
+  switch (pomo.mode()) {
+    case timerlogic::PomodoroTimer::M_WORK:
+      snprintf(head, sizeof(head), "CALISMA %u", static_cast<unsigned>(pomo.completedRounds() + 1));
+      break;
+    case timerlogic::PomodoroTimer::M_SHORT: snprintf(head, sizeof(head), "KISA MOLA"); break;
+    case timerlogic::PomodoroTimer::M_LONG:  snprintf(head, sizeof(head), "UZUN MOLA"); break;
+    default:                                 snprintf(head, sizeof(head), "SAYAC"); break;
+  }
+  display.setCursor(0, 0);
+  display.print(head);
+
+  char tbuf[8];
+  formatMmSs(tbuf, sizeof(tbuf), pomo.remainingMs(now));
+  display.setTextSize(4);
+  display.setCursor(4, 12);
+  display.print(tbuf);
+
+  uint32_t total = pomo.totalMs();
+  uint32_t left = pomo.remainingMs(now);
+  int fill = total > 0 ? static_cast<int>((static_cast<uint64_t>(total - left) * 124) / total) : 0;
+  display.drawRect(0, 48, 128, 6, SH110X_WHITE);
+  display.fillRect(2, 50, fill, 2, SH110X_WHITE);
+
+  display.setTextSize(1);
+  display.setCursor(0, 56);
+  display.print(pomo.paused() ? "DURAKLADI - dokun: devam" : "dokun: duraklat");
+  display.display();
+}
+
+// ---- Alarm ekrani (sure bitince; ses loop() icinden SND_ALARM ile calinir) ----
+static uint8_t alarmBeeps = 0;
+static uint32_t alarmNextAt = 0;
+static bool alarmInverted = false;
+
+static void alarmEnter(int32_t) {
+  alarmBeeps = 0;
+  alarmNextAt = actSince;
+  alarmInverted = false;
+}
+
+static void alarmEvent(ActEvent e) {
+  if (e == AEV_TAP || e == AEV_LONG) activityFinish();
+}
+
+static void alarmTick(uint32_t now) {
+  if (alarmBeeps < 3 && now >= alarmNextAt) {
+    pendingSound = SND_ALARM;     // loop() calar
+    alarmBeeps++;
+    alarmNextAt = now + 2200;
+  }
+  if (now - actSince >= 9000) activityFinish();
+}
+
+static void alarmRender(uint32_t now) {
+  bool inv = ((now - actSince) / 350) % 2 == 0;
+  if (inv != alarmInverted) {
+    alarmInverted = inv;
+    display.invertDisplay(inv);
+  }
+
+  static uint32_t lastDraw = 0;
+  if (now - lastDraw < 100) return;
+  lastDraw = now;
+
+  const char *l1, *l2;
+  switch (alarmMode) {
+    case timerlogic::PomodoroTimer::M_WORK:  l1 = "MOLA";  l2 = "ZAMANI!"; break;
+    case timerlogic::PomodoroTimer::M_SHORT:
+    case timerlogic::PomodoroTimer::M_LONG:  l1 = "HAYDI"; l2 = "CALISMA!"; break;
+    default:                                 l1 = "SURE";  l2 = "DOLDU!"; break;
+  }
+
+  display.clearDisplay();
+  display.setTextColor(SH110X_WHITE);
+  display.setTextSize(2);
+  display.setCursor(4, 10);
+  display.print(l1);
+  display.setCursor(4, 34);
+  display.print(l2);
+  display.display();
+}
+
+static void alarmExit() {
+  alarmInverted = false;
+  display.invertDisplay(false);
+}
+
 static const Activity ACTIVITIES[ACT_COUNT] = {
   {"Gozler", nullptr, nullptr, nullptr, nullptr, nullptr},                       // ACT_NONE (kullanilmaz)
   {"Animasyon", animEnter, animEvent, animTick, animRender, animExit},           // ACT_ANIM
+  {"Zamanlayici", timerEnter, timerEvent, nullptr, timerRender, nullptr},        // ACT_TIMER
+  {"Alarm", alarmEnter, alarmEvent, alarmTick, alarmRender, alarmExit},          // ACT_ALARM
 };
 
 static void activityStop() {
@@ -909,6 +1071,12 @@ static void behaviorStep() {
       enterMode(B_FAREWELL);
     } else if (bMode == B_LISTEN || bMode == B_SPEAK) {
       enterMode(B_ROAM);
+    }
+
+    timerTick(now);                            // zamanlayici yalnizca konusma yokken ilerler
+    if (alarmPending && bMode != B_UNTHINK) {  // sure doldu: alarm ekrani
+      alarmPending = false;
+      activityStart(ACT_ALARM, 0);
     }
 
     if (curAct != nullptr) {                   // etkinlik surerken (yalnizca konusma yokken)
@@ -1858,6 +2026,12 @@ static void playSound(SoundId id) {
       break;
     case SND_YAWN:
       playToneSweep(520, 220, 650, 9000);
+      break;
+    case SND_ALARM:   // zamanlayici doldu
+      for (int i = 0; i < 3; i++) {
+        playToneSweep(1250, 1250, 130, 12000);
+        playToneSweep(100, 100, 90, 0);
+      }
       break;
     default:
       break;
