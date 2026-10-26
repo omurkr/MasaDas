@@ -20,6 +20,8 @@
 #include <freertos/stream_buffer.h>
 #include <vector>
 #include "logic/timer_logic.h"
+#include "logic/game_logic.h"
+#include <Preferences.h>
 
 // ---------- Sure olcumu ----------
 static uint32_t tStart = 0;
@@ -51,7 +53,7 @@ enum AppPhase : uint8_t {
   PHASE_FAREWELL    // konusma sessizlikle bitti
 };
 
-enum SoundId : uint8_t { SND_NONE, SND_LISTEN, SND_HAPPY, SND_ANGRY, SND_YAWN, SND_ALARM };
+enum SoundId : uint8_t { SND_NONE, SND_LISTEN, SND_HAPPY, SND_ANGRY, SND_YAWN, SND_ALARM, SND_OK, SND_MISS };
 
 static volatile AppPhase appPhase = PHASE_IDLE;
 static volatile uint8_t ttsLevel = 0;               // 0..255, calan sesin siddeti
@@ -178,6 +180,7 @@ static constexpr unsigned long TOUCH_WARMUP_MS = 2000;
 static volatile uint32_t touchPressSeq = 0;   // her basista artar
 static volatile uint32_t touchTapSeq = 0;     // kisa dokunus birakilinca artar
 static volatile uint32_t touchLongSeq = 0;    // uzun basma tamamlaninca artar
+static volatile uint32_t touchPressAtMs = 0;  // son basmanin ham (sicrama beklemeden onceki) zamani
 
 static bool takeEvent(volatile uint32_t &seq, uint32_t &seen) {
     uint32_t v = seq;
@@ -223,7 +226,10 @@ static void touchTask(void *parameter) {
                 pressValid = (now - lastRelease >= TOUCH_MIN_GAP_MS);
                 pressStart = now;
                 longFired = false;
-                if (pressValid) touchPressSeq = touchPressSeq + 1;
+                if (pressValid) {
+                    touchPressAtMs = lastChange;   // sensorun ilk degistigi an
+                    touchPressSeq = touchPressSeq + 1;
+                }
             } else {
                 lastRelease = now;
                 if (pressValid && !longFired) touchTapSeq = touchTapSeq + 1;
@@ -306,7 +312,7 @@ static uint32_t headDelayAt = 0;
 static float headDelayTarget = SERVO_CENTER;
 
 // Etkinlik yoneticisi (ayrintisi behaviorStep'in ustunde). Roam adimi bosta sessiz animasyon baslatir.
-enum ActId : uint8_t { ACT_NONE, ACT_ANIM, ACT_TIMER, ACT_ALARM, ACT_COUNT };
+enum ActId : uint8_t { ACT_NONE, ACT_ANIM, ACT_TIMER, ACT_ALARM, ACT_REACTION, ACT_DOTS, ACT_COUNT };
 enum AnimId : uint8_t { ANIM_LAUGH, ANIM_SURPRISE, ANIM_SWEAT, ANIM_SCAN, ANIM_GLITCH, ANIM_HEARTS, ANIM_DIZZY, ANIM_COUNT };
 static uint32_t lastAnimAt = 0;
 static constexpr int32_t ANIM_QUIET_BASE = 100;   // arg >= 100: sessiz (bosta rastgele tetiklenen) animasyon
@@ -955,11 +961,230 @@ static void alarmExit() {
   display.invertDisplay(false);
 }
 
+// ---- Oyunlar: tepki suresi ve nokta yakala (yalnizca dokunma) ----
+// En iyi skorlar gamesDirty ile isaretlenir; NVS yazimini loop() yapar (davranis gorevinin yigini kucuk).
+static gamelogic::ReactionGame rg;
+static gamelogic::DotGame dg;
+static volatile bool gamesDirty = false;
+
+static uint32_t gameResultAt = 0;
+static int8_t gameDrawnState = -1;
+static uint32_t dotFlashUntil = 0;
+
+static uint32_t randomReactionWait() { return static_cast<uint32_t>(random(2000, 5001)); }
+
+// -- Tepki suresi --
+static void reactEnter(int32_t) {
+  rg.start(actSince, randomReactionWait());
+  gameDrawnState = -1;
+}
+
+static void reactEvent(ActEvent e) {
+  if (e == AEV_LONG) { activityFinish(); return; }
+  if (e != AEV_PRESS) return;
+
+  uint32_t now = millis();
+
+  switch (rg.state()) {
+    case gamelogic::ReactionGame::S_WAIT:
+    case gamelogic::ReactionGame::S_GO:
+      rg.onPress(touchPressAtMs);   // ham dokunus zamani
+      if (rg.state() == gamelogic::ReactionGame::S_RESULT) {
+        if (rg.newBest()) { gamesDirty = true; pendingSound = SND_OK; }
+      } else if (rg.state() == gamelogic::ReactionGame::S_EARLY) {
+        pendingSound = SND_MISS;
+      }
+      gameResultAt = now;
+      gameDrawnState = -1;
+      break;
+
+    default:   // sonuc ekrani: dokununca yeni tur
+      if (now - gameResultAt > 500) {
+        rg.start(now, randomReactionWait());
+        gameDrawnState = -1;
+      }
+      break;
+  }
+}
+
+static void reactTick(uint32_t now) {
+  if (rg.update(now)) gameDrawnState = -1;
+}
+
+static void reactRender(uint32_t now) {
+  (void)now;
+  using RG = gamelogic::ReactionGame;
+
+  if (rg.state() == RG::S_GO) {
+    if (rg.goShown()) return;
+
+    // Sinyal: beyaz ekran. Ekrana yazma bitince zaman damgasi alinir.
+    display.clearDisplay();
+    display.fillRect(0, 0, OLED_WIDTH, OLED_HEIGHT, SH110X_WHITE);
+    display.setTextColor(SH110X_BLACK);
+    display.setTextSize(4);
+    display.setCursor(16, 16);
+    display.print("BAS!");
+    display.display();
+    rg.markShown(millis());
+    gameDrawnState = RG::S_GO;
+    return;
+  }
+
+  if (gameDrawnState == rg.state()) return;   // durum degismedikce yeniden cizme
+  gameDrawnState = rg.state();
+
+  char line[24];
+  display.clearDisplay();
+  display.setTextColor(SH110X_WHITE);
+  display.setTextSize(1);
+
+  switch (rg.state()) {
+    case RG::S_WAIT:
+      display.setCursor(0, 0);
+      display.print("Tepki oyunu");
+      display.setTextSize(2);
+      display.setCursor(16, 26);
+      display.print("BEKLE...");
+      break;
+
+    case RG::S_RESULT:
+      display.setCursor(0, 0);
+      display.print("Tepki oyunu");
+      display.setTextSize(2);
+      snprintf(line, sizeof(line), "%lu ms", static_cast<unsigned long>(rg.reactionMs()));
+      display.setCursor(8, 16);
+      display.print(line);
+      display.setTextSize(1);
+      snprintf(line, sizeof(line), "En iyi: %lu ms%s", static_cast<unsigned long>(rg.best()),
+               rg.newBest() ? " YENI!" : "");
+      display.setCursor(0, 42);
+      display.print(line);
+      display.setCursor(0, 54);
+      display.print("Dokun: tekrar");
+      break;
+
+    default:   // S_EARLY
+      display.setCursor(0, 0);
+      display.print("Tepki oyunu");
+      display.setTextSize(2);
+      display.setCursor(4, 20);
+      display.print("ERKEN!");
+      display.setTextSize(1);
+      display.setCursor(0, 54);
+      display.print("Dokun: tekrar");
+      break;
+  }
+
+  display.display();
+}
+
+// -- Nokta yakala --
+static void dotsEnter(int32_t) {
+  dg.start(actSince, random(0, 2) == 0);
+  dotFlashUntil = 0;
+}
+
+static void dotsEvent(ActEvent e) {
+  if (e == AEV_LONG) { activityFinish(); return; }
+  if (e != AEV_PRESS) return;
+
+  uint32_t now = millis();
+
+  if (dg.state() == gamelogic::DotGame::S_PLAY) {
+    dg.update(now);
+    gamelogic::DotGame::Result r = dg.onTap(now);
+
+    if (r == gamelogic::DotGame::R_HIT) {
+      pendingSound = SND_OK;
+      dotFlashUntil = now + 120;
+    } else if (r == gamelogic::DotGame::R_MISS) {
+      pendingSound = SND_MISS;
+    }
+
+    if (dg.state() == gamelogic::DotGame::S_OVER && dg.newBest()) gamesDirty = true;
+  } else if (now - dg.overAt() > 700) {     // oyun bitti: dokununca yeni oyun
+    dg.start(now, random(0, 2) == 0);
+  }
+}
+
+static void dotsTick(uint32_t now) { dg.update(now); }
+
+static void dotsRender(uint32_t now) {
+  static uint32_t lastDraw = 0;
+  if (now - lastDraw < 25) return;
+  lastDraw = now;
+
+  char line[24];
+  display.clearDisplay();
+  display.setTextColor(SH110X_WHITE);
+  display.setTextSize(1);
+
+  if (dg.state() == gamelogic::DotGame::S_OVER) {
+    display.setCursor(0, 0);
+    display.print("Nokta yakala");
+    display.setTextSize(2);
+    snprintf(line, sizeof(line), "Skor %d", dg.score());
+    display.setCursor(8, 16);
+    display.print(line);
+    display.setTextSize(1);
+    snprintf(line, sizeof(line), "En iyi: %lu%s", static_cast<unsigned long>(dg.best()),
+             dg.newBest() ? " YENI!" : "");
+    display.setCursor(0, 42);
+    display.print(line);
+    display.setCursor(0, 54);
+    display.print("Dokun: tekrar");
+    display.display();
+    return;
+  }
+
+  snprintf(line, sizeof(line), "Skor %d", dg.score());
+  display.setCursor(0, 0);
+  display.print(line);
+
+  for (int i = 0; i < dg.lives(); i++) {     // kalan can: dolu daireler
+    display.fillCircle(122 - i * 10, 4, 3, SH110X_WHITE);
+  }
+
+  int zl = lroundf(gamelogic::DotGame::CENTER - dg.zoneHalf());
+  int zw = lroundf(dg.zoneHalf() * 2.0f);
+  display.drawFastHLine(4, 38, 120, SH110X_WHITE);                        // iz
+  display.drawRect(zl, 24, zw, 28, SH110X_WHITE);                         // hedef bolge
+  if (now < dotFlashUntil) display.fillRect(zl, 24, zw, 28, SH110X_WHITE);
+
+  display.fillCircle(lroundf(dg.x()), 38, 5, SH110X_WHITE);               // nokta
+  display.display();
+}
+
+static void gamesLoadBest() {
+  Preferences prefs;
+  if (prefs.begin("masadas", true)) {
+    rg.setBest(prefs.getUInt("bestrt", 0));
+    dg.setBest(prefs.getUInt("bestdot", 0));
+    prefs.end();
+  }
+}
+
+// loop() cagirir: yeni rekor varsa NVS'e yazar.
+static void gamesPersist() {
+  if (!gamesDirty) return;
+  gamesDirty = false;
+
+  Preferences prefs;
+  if (prefs.begin("masadas", false)) {
+    prefs.putUInt("bestrt", rg.best());
+    prefs.putUInt("bestdot", dg.best());
+    prefs.end();
+  }
+}
+
 static const Activity ACTIVITIES[ACT_COUNT] = {
   {"Gozler", nullptr, nullptr, nullptr, nullptr, nullptr},                       // ACT_NONE (kullanilmaz)
   {"Animasyon", animEnter, animEvent, animTick, animRender, animExit},           // ACT_ANIM
   {"Zamanlayici", timerEnter, timerEvent, nullptr, timerRender, nullptr},        // ACT_TIMER
   {"Alarm", alarmEnter, alarmEvent, alarmTick, alarmRender, alarmExit},          // ACT_ALARM
+  {"Tepki oyunu", reactEnter, reactEvent, reactTick, reactRender, nullptr},      // ACT_REACTION
+  {"Nokta oyunu", dotsEnter, dotsEvent, dotsTick, dotsRender, nullptr},          // ACT_DOTS
 };
 
 static void activityStop() {
@@ -2027,6 +2252,14 @@ static void playSound(SoundId id) {
     case SND_YAWN:
       playToneSweep(520, 220, 650, 9000);
       break;
+    case SND_OK:   // oyunda isabet / yeni rekor
+      playToneSweep(800, 1000, 70, 10000);
+      playToneSweep(100, 100, 30, 0);
+      playToneSweep(1000, 1300, 90, 10000);
+      break;
+    case SND_MISS:   // oyunda kacirma / erken dokunma
+      playToneSweep(300, 180, 140, 10000);
+      break;
     case SND_ALARM:   // zamanlayici doldu
       for (int i = 0; i < 3; i++) {
         playToneSweep(1250, 1250, 130, 12000);
@@ -2932,6 +3165,7 @@ void setup() {
   setupServo();
   setupTouch();
   startBehaviorTask();
+  gamesLoadBest();   // oyun rekorlari (NVS)
 
   if (String(WIFI_SSID).isEmpty() ||
       String(WIFI_PASSWORD).isEmpty() ||
@@ -2984,6 +3218,7 @@ void loop() {
     if (!consumed) runConversation();
   }
 
+  gamesPersist();   // yeni rekor varsa NVS'e yazar (loop yalnizca konusma yokken buraya gelir)
   playPendingSound();
   delay(10);
 }
